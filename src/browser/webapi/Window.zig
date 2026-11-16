@@ -918,6 +918,16 @@ pub fn scrollTo(self: *Window, opts: Element.ScrollToOpts, y: ?i32, frame: *Fram
     self._scroll_pos.x = new_x;
     self._scroll_pos.y = new_y;
     self._scroll_pos.state = .scroll;
+    const layout_io = self._frame.layoutIntersectionEnabled();
+    if (layout_io) {
+        self._frame._box_layout_version +%= 1;
+    }
+
+    const has_io = layout_io and Frame.observers.hasIntersectionObservers(self._frame);
+    if (has_io) {
+        self._frame._intersection.recheck_all = true;
+        Frame.observers.scheduleIntersectionChecks(self._frame);
+    }
 
     // We dispatch scroll event asynchronously after 10ms. So we can throttle
     // them.
@@ -969,6 +979,9 @@ pub fn scrollTo(self: *Window, opts: Element.ScrollToOpts, y: ?i32, frame: *Fram
         20,
         .{ .blocks_done = false },
     );
+    if (has_io) {
+        self._frame.js.env.runMicrotasks();
+    }
 }
 
 fn scrollLimit(size: f64, visible: u32) u32 {

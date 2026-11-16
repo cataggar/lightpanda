@@ -167,21 +167,51 @@ pub fn processMessage(cmd: *CDP.Command) !void {
     }
 }
 
+// Emulates network conditions for the browser's HTTP client. Download and
+// upload throughput limits are paced per transfer via libcurl
+// (CURLOPT_MAX_RECV_SPEED_LARGE / CURLOPT_MAX_SEND_SPEED_LARGE).
 fn emulateNetworkConditions(cmd: *CDP.Command) !void {
     const params = (try cmd.params(struct {
         offline: bool,
         latency: f64,
         downloadThroughput: f64,
         uploadThroughput: f64,
+        connectionType: ?[]const u8 = null,
     })) orelse return error.InvalidParams;
 
-    if (params.offline) {
-        return cmd.sendError(-32000, "Offline emulation is not supported", .{});
+    if (!std.math.isFinite(params.latency) or
+        !std.math.isFinite(params.downloadThroughput) or
+        !std.math.isFinite(params.uploadThroughput))
+    {
+        return error.InvalidParams;
     }
-    // -1 disables a throughput limit.
-    if (params.latency > 0 or params.downloadThroughput > 0 or params.uploadThroughput > 0) {
-        log.debug(.not_implemented, "Network.emulateConditions", .{ .param = "throttling" });
+
+    if (params.connectionType) |ct| {
+        log.debug(.not_implemented, "Network.emulateConditions", .{ .param = "connectionType", .value = ct });
     }
+
+    const bc = cmd.browser_context orelse return error.BrowserContextNotLoaded;
+    const latency_ms: u64 = if (params.latency > 0)
+        @intFromFloat(@min(std.math.round(params.latency), @as(f64, @floatFromInt(std.math.maxInt(u64) / 2))))
+    else
+        0;
+    const dl_bps: i64 = if (params.downloadThroughput > 0)
+        @intFromFloat(@min(std.math.floor(params.downloadThroughput), @as(f64, @floatFromInt(std.math.maxInt(i64) / 2))))
+    else
+        -1;
+    const ul_bps: i64 = if (params.uploadThroughput > 0)
+        @intFromFloat(@min(std.math.floor(params.uploadThroughput), @as(f64, @floatFromInt(std.math.maxInt(i64) / 2))))
+    else
+        -1;
+
+    cmd.cdp.browser.http_client.setNetworkConditions(.{
+        .offline = params.offline,
+        .latency_ms = latency_ms,
+        .download_throughput = dl_bps,
+        .upload_throughput = ul_bps,
+    });
+    bc.network_conditions_changed = true;
+
     return cmd.sendResult(null, .{});
 }
 
@@ -244,6 +274,7 @@ fn setExtraHTTPHeaders(cmd: *CDP.Command) !void {
     })) orelse return error.InvalidParams;
 
     const target = try cmd.target();
+    const allow_mozilla = target.session.browser.app.config.experimentalFeatures().ua_override;
 
     // Copy the headers onto the target's arena
     const arena = target.arena.allocator();
@@ -267,7 +298,7 @@ fn setExtraHTTPHeaders(cmd: *CDP.Command) !void {
         }
 
         if (std.ascii.eqlIgnoreCase(key, "user-agent")) {
-            Config.validateUserAgent(value) catch |err| {
+            Config.validateUserAgentWithOpts(value, allow_mozilla) catch |err| {
                 log.debug(.cdp, "network.setExtraHTTPHeaders", .{ .param = "userAgent", .value = value, .err = err });
                 continue;
             };
@@ -840,13 +871,15 @@ test "cdp.network emulateNetworkConditions and setBypassServiceWorker" {
     testing.silenceLog(&.{.not_implemented});
     var ctx = try testing.context();
     defer ctx.deinit();
-    _ = try ctx.loadBrowserContext(.{ .id = "BID-NET" });
+    const bc = try ctx.loadBrowserContext(.{ .id = "BID-NET" });
 
     try ctx.processMessage(.{ .id = 1, .method = "Network.emulateNetworkConditions", .params = .{ .offline = false, .latency = 0, .downloadThroughput = -1, .uploadThroughput = -1 } });
     try ctx.expectSentResult(null, .{ .id = 1 });
+    try testing.expectEqual(false, bc.cdp.browser.http_client.network_conditions.offline);
 
     try ctx.processMessage(.{ .id = 2, .method = "Network.emulateNetworkConditions", .params = .{ .offline = true, .latency = 0, .downloadThroughput = -1, .uploadThroughput = -1 } });
-    try ctx.expectSentError(-32000, "Offline emulation is not supported", .{ .id = 2 });
+    try ctx.expectSentResult(null, .{ .id = 2 });
+    try testing.expectEqual(true, bc.cdp.browser.http_client.network_conditions.offline);
 
     try ctx.processMessage(.{ .id = 3, .method = "Network.setBypassServiceWorker", .params = .{ .bypass = true } });
     try ctx.expectSentResult(null, .{ .id = 3 });
@@ -930,6 +963,28 @@ test "cdp.network setExtraHTTPHeaders accepts valid User-Agent" {
 
     const bc = &ctx.cdp().browser_context.?;
     try testing.expectEqual((try testing.firstTarget(bc)).extra_headers.items.len, 1);
+}
+
+test "cdp.network setExtraHTTPHeaders honors ua_override" {
+    var ctx = try testing.context();
+    defer ctx.deinit();
+
+    const saved = testing.base.test_config.mode.serve.experimental_features;
+    testing.base.test_config.mode.serve.experimental_features.ua_override = true;
+    defer testing.base.test_config.mode.serve.experimental_features = saved;
+
+    _ = try ctx.loadBrowserContext(.{ .id = "NID-UA3B", .session_id = "NESI-UA3B" });
+
+    try ctx.processMessage(.{
+        .id = 3,
+        .method = "Network.setExtraHTTPHeaders",
+        .params = .{ .headers = .{ .@"User-Agent" = "Mozilla/5.0 ExtraBot/1.0" } },
+    });
+
+    const bc = &ctx.cdp().browser_context.?;
+    const target = try testing.firstTarget(bc);
+    try testing.expectEqual(@as(usize, 1), target.extra_headers.items.len);
+    try testing.expectEqual("Mozilla/5.0 ExtraBot/1.0", target.extra_headers.items[0].value);
 }
 
 test "cdp.network setExtraHTTPHeaders rejects a Mozilla User-Agent smuggled via a colon in the key" {
@@ -1971,4 +2026,103 @@ test "cdp.Network: worker requests emit network events" {
         .type = "Fetch",
         .request = .{ .url = api_url },
     }, .{ .session_id = "SID-NW" });
+}
+
+test "cdp.Network: emulateNetworkConditions offline and throttling" {
+    testing.silenceLog(&.{.http});
+
+    var ctx = try testing.context();
+    defer ctx.deinit();
+
+    const bc = try ctx.loadBrowserContext(.{
+        .id = "BID-ENC",
+        .session_id = "SID-ENC",
+        .url = "cdp/dom1.html",
+    });
+    const target = try testing.firstTarget(bc);
+    const frame_id = target.frame_id.?;
+    const frame = target.mainFrame() orelse unreachable;
+    const client = &bc.cdp.browser.http_client;
+
+    try ctx.processMessage(.{ .id = 1, .method = "Network.enable" });
+    try ctx.expectSentResult(null, .{ .id = 1 });
+
+    // Enable offline mode and throttling parameters.
+    try ctx.processMessage(.{
+        .id = 2,
+        .method = "Network.emulateNetworkConditions",
+        .params = .{
+            .offline = true,
+            .latency = 40,
+            .downloadThroughput = 32768,
+            .uploadThroughput = 16384,
+        },
+    });
+    try ctx.expectSentResult(null, .{ .id = 2 });
+    try testing.expectEqual(true, client.network_conditions.offline);
+    try testing.expectEqual(@as(u64, 40), client.network_conditions.latency_ms);
+    try testing.expectEqual(@as(i64, 32768), client.network_conditions.download_throughput);
+    try testing.expectEqual(@as(i64, 16384), client.network_conditions.upload_throughput);
+
+    {
+        var ls: lp.js.Local.Scope = undefined;
+        frame.js.localScope(&ls);
+        defer ls.deinit();
+        const online = try ls.local.exec("navigator.onLine", null);
+        try testing.expect(!online.toBool());
+    }
+
+    const ErrorContext = struct {
+        err: ?anyerror = null,
+
+        fn callback(raw: *anyopaque, err: anyerror) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.err = err;
+        }
+    };
+    var error_context: ErrorContext = .{};
+    var request_id: [14]u8 = undefined;
+    _ = std.mem.print(&request_id, "REQ-{d:0>10}", .{client.next_request_id +% 1}) catch unreachable;
+
+    try client.request(.{
+        .frame_id = frame_id,
+        .loader_id = 1,
+        .method = .GET,
+        .url = "http://127.0.0.1:9582/echo_method",
+        .origin = target.security_origin,
+        .credentials_mode = .omit,
+        .request_mode = .no_cors,
+        .resource_type = .fetch,
+        .notification = bc.session.notification,
+        .ctx = &error_context,
+        .error_callback = ErrorContext.callback,
+        .shutdown_callback = HttpClient.noopShutdown,
+    }, null);
+
+    try ctx.expectSentEvent("Network.loadingFailed", .{
+        .requestId = &request_id,
+        .errorText = "net::ERR_INTERNET_DISCONNECTED",
+    }, .{ .session_id = "SID-ENC" });
+    try testing.expectEqual(error.InternetDisconnected, error_context.err.?);
+
+    // Restore online mode with latency and verify delayed delivery succeeds.
+    try ctx.processMessage(.{
+        .id = 3,
+        .method = "Network.emulateNetworkConditions",
+        .params = .{
+            .offline = false,
+            .latency = 25,
+            .downloadThroughput = -1,
+            .uploadThroughput = -1,
+        },
+    });
+    try ctx.expectSentResult(null, .{ .id = 3 });
+    try testing.expectEqual(false, client.network_conditions.offline);
+    try testing.expectEqual(@as(u64, 25), client.network_conditions.latency_ms);
+    try testing.expectEqual(@as(i64, -1), client.network_conditions.download_throughput);
+
+    const start_ms = lp.datetime.milliTimestamp(.boot);
+    _ = try EchoDriver.run(bc, frame_id, "ping", null);
+    const elapsed_ms = lp.datetime.milliTimestamp(.boot) - start_ms;
+    try testing.expect(elapsed_ms >= 20);
 }

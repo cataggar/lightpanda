@@ -74,6 +74,7 @@ fn attributeChanged(element: *Element, name: String, old: ?[]const u8, new: ?[]c
     }
     if (name.eql(comptime .wrap("style"))) {
         if (owner._style_manager.styleAttributeChanged(element, old, new)) {
+            if (owner != frame) layoutObserversChanged(owner);
             layoutObserversChanged(frame);
             return;
         }
@@ -82,10 +83,12 @@ fn attributeChanged(element: *Element, name: String, old: ?[]const u8, new: ?[]c
             // the stylemanager handled the classChange (maybe it was a noop
             // maybe there was an optimized path). Whatever the case, we don't
             // need to signal a rendering change.
+            if (owner != frame) layoutObserversChanged(owner);
             layoutObserversChanged(frame);
             return;
         }
     }
+    if (owner != frame) layoutObserversChanged(owner);
     renderingChanged(frame);
 }
 
@@ -113,6 +116,7 @@ fn treeChanged(parent: *Node, child: *Node, previous: ?*Node, next: ?*Node, op: 
             // the tree, we need to invalidate everything
             styleChanged(frame);
         }
+        if (owner != frame) layoutObserversChanged(owner);
     }
     layoutObserversChanged(frame);
 }
@@ -149,6 +153,14 @@ pub fn textChanged(cdata: *CData, old: String, frame: *Frame) void {
     _ = old;
     if (detachedHandled(cdata.asNode(), frame) == false) {
         styleChanged(frame);
+        if (cdata.asNode().ownerFrame(frame)) |owner| {
+            if (owner != frame and owner.layoutIntersectionEnabled()) {
+                layoutObserversChanged(owner);
+            }
+        }
+        if (frame.layoutIntersectionEnabled()) {
+            layoutObserversChanged(frame);
+        }
     }
 }
 
@@ -215,6 +227,10 @@ pub fn documentStateChanged(state: DocumentState, frame: *Frame) void {
 /// rebuilt. An observed size can change without any element changing.
 pub fn rulesChanged(frame: *Frame) void {
     styleChanged(frame);
+    if (frame.layoutIntersectionEnabled()) {
+        frame._intersection.recheck_all = true;
+        observers.scheduleIntersectionChecks(frame);
+    }
     observers.scheduleResizeDelivery(frame);
 }
 
@@ -277,6 +293,10 @@ fn renderingChanged(frame: *Frame) void {
 /// A change that can move a box without changing any selector match or
 /// cascaded value, like an inline transform: only the layout observers look.
 fn layoutObserversChanged(frame: *Frame) void {
+    frame._box_layout_version +%= 1;
+    if (frame.layoutIntersectionEnabled()) {
+        frame._intersection.recheck_all = true;
+    }
     observers.scheduleIntersectionChecks(frame);
     observers.scheduleResizeChecks(frame);
 }
@@ -285,6 +305,7 @@ fn layoutObserversChanged(frame: *Frame) void {
 /// result, including non-tree state that live collections never see.
 fn styleChanged(frame: *Frame) void {
     frame.page.style_version += 1;
+    frame._box_layout_version +%= 1;
 }
 
 const testing = @import("../../testing.zig");

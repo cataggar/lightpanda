@@ -68,8 +68,8 @@ fn getLanguage(_: *const WorkerNavigator, exec: *const Execution) []const u8 {
     return Navigator.getLanguage(&Navigator.init, exec);
 }
 
-fn getOnLine(_: *const WorkerNavigator) bool {
-    return Navigator.getOnLine(&Navigator.init);
+fn getOnLine(_: *const WorkerNavigator, exec: *const Execution) bool {
+    return Navigator.getOnLine(&Navigator.init, exec);
 }
 
 fn getHardwareConcurrency(_: *const WorkerNavigator) u32 {

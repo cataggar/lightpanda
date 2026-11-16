@@ -238,6 +238,8 @@ const CurlOption = enum(c.CURLoption) {
     connect_to = c.CURLOPT_CONNECT_TO,
     share = c.CURLOPT_SHARE,
     resolve = c.CURLOPT_RESOLVE,
+    max_send_speed_large = c.CURLOPT_MAX_SEND_SPEED_LARGE,
+    max_recv_speed_large = c.CURLOPT_MAX_RECV_SPEED_LARGE,
 };
 
 pub const CurlHttpVersion = enum(c_long) {
@@ -646,6 +648,10 @@ pub fn curl_easy_setopt(easy: *Curl, comptime option: CurlOption, value: anytype
         .post_field_size,
         .connect_only,
         => @as(c_long, @intCast(value)),
+
+        .max_send_speed_large,
+        .max_recv_speed_large,
+        => @as(CurlOffT, @intCast(value)),
 
         .url,
         .proxy,

@@ -151,7 +151,8 @@ pub fn setUserAgentOverride(cmd: *CDP.Command) !void {
     }
 
     const ua = params.userAgent;
-    const reserved = if (Config.validateUserAgent(ua)) false else |err| switch (err) {
+    const allow_ua_override = cmd.cdp.app.config.experimentalFeatures().ua_override;
+    const reserved = if (Config.validateUserAgentWithOpts(ua, allow_ua_override)) false else |err| switch (err) {
         error.NonPrintable => return cmd.sendError(-32602, "User agent contains non-printable characters", .{}),
         error.Reserved => true,
     };
@@ -173,8 +174,12 @@ pub fn setUserAgentOverride(cmd: *CDP.Command) !void {
         return cmd.sendResult(null, .{});
     }
 
-    try http_client.setUserAgentOverride(ua);
-    bc.user_agent_changed = true;
+    if (ua.len == 0) {
+        http_client.clearUserAgentOverride();
+    } else {
+        try http_client.setUserAgentOverride(ua);
+        bc.user_agent_changed = true;
+    }
 
     return cmd.sendResult(null, .{});
 }
@@ -834,5 +839,34 @@ test "cdp.Emulation: navigator.geolocation errors PERMISSION_DENIED when permiss
     defer ls.deinit();
 
     const v = try ls.local.exec("window.__geo_code === 1", null);
+    try testing.expect(v.isTrue());
+}
+
+test "cdp.Emulation: setUserAgentOverride accepts Mozilla when ua_override is enabled" {
+    var ctx = try testing.context();
+    defer ctx.deinit();
+
+    const saved_features = testing.base.test_config.mode.serve.experimental_features;
+    testing.base.test_config.mode.serve.experimental_features.ua_override = true;
+    defer testing.base.test_config.mode.serve.experimental_features = saved_features;
+
+    const bc = try ctx.loadBrowserContext(.{ .id = "BID-UA-OVERRIDE", .url = "cdp/dom1.html" });
+
+    try ctx.processMessage(.{
+        .id = 1,
+        .method = "Emulation.setUserAgentOverride",
+        .params = .{ .userAgent = "Mozilla/5.0 TestBrowser/1.0" },
+    });
+    try ctx.expectSentResult(null, .{ .id = 1 });
+    try testing.expectEqual(true, bc.user_agent_changed);
+    try std.testing.expectEqualStrings("Mozilla/5.0 TestBrowser/1.0", bc.cdp.browser.http_client.getUserAgent());
+
+    const target = try testing.firstTarget(bc);
+    const frame = target.mainFrame() orelse unreachable;
+    var ls: js.Local.Scope = undefined;
+    frame.js.localScope(&ls);
+    defer ls.deinit();
+
+    const v = try ls.local.exec("navigator.userAgent === 'Mozilla/5.0 TestBrowser/1.0'", null);
     try testing.expect(v.isTrue());
 }

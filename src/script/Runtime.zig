@@ -498,6 +498,11 @@ fn closeCallback(info_handle: ?*const v8.FunctionCallbackInfo) callconv(.c) void
     self.invokeClose(info);
 }
 
+fn setViewportCallback(info_handle: ?*const v8.FunctionCallbackInfo) callconv(.c) void {
+    const info, const self = callbackData(Runtime, info_handle) orelse return;
+    self.invokeSetViewport(info);
+}
+
 /// `new Page()`: attach a method for every recorded tool (including `goto`) plus
 /// `close`. `__lpFrameId` is left unset until the first `goto` navigates the page.
 fn construct(self: *Runtime, info: *const v8.FunctionCallbackInfo) void {
@@ -521,6 +526,7 @@ fn construct(self: *Runtime, info: *const v8.FunctionCallbackInfo) void {
 
 const PageMethod = struct {
     name: []const u8,
+    call: []const u8,
     callback: Callback,
     /// Rendered by `zig build docs`.
     summary: []const u8,
@@ -529,12 +535,26 @@ const PageMethod = struct {
 
 /// The page methods besides the recorded tools.
 pub const page_methods = [_]PageMethod{
-    .{ .name = "close", .callback = closeCallback, .summary = "Stales the handle, so later calls on it fail. The page itself is reclaimed on the next `goto` or at script end.", .returns = "Nothing" },
+    .{
+        .name = "close",
+        .call = "page.close()",
+        .callback = closeCallback,
+        .summary = "Stales the handle, so later calls on it fail. The page itself is reclaimed on the next `goto` or at script end.",
+        .returns = "Nothing",
+    },
+    .{
+        .name = "setViewport",
+        .call = "page.setViewport(width, height[, { deviceScaleFactor }])",
+        .callback = setViewportCallback,
+        .summary = "Resizes the browser viewport in CSS pixels. Also accepts a single `{ width, height, deviceScaleFactor }` object.",
+        .returns = "Nothing",
+    },
 };
 
 /// Property carrying a page handle's claim on a live frame. Numeric while the
 /// page is navigated; absent/undefined once never-navigated or closed.
 const frame_id_key = "__lpFrameId";
+const closed_key = "__lpClosed";
 
 /// `page.close()`: stale the wrapper so later method calls error. A single
 /// synchronous page has no popups to free; the active page is reclaimed on the
@@ -543,6 +563,128 @@ fn invokeClose(self: *Runtime, info: *const v8.FunctionCallbackInfo) void {
     const context = v8.v8__Isolate__GetCurrentContext(self.env.isolate.handle) orelse return;
     const this = v8.v8__FunctionCallbackInfo__This(info) orelse return;
     self.setObjectProperty(context, this, frame_id_key, self.env.isolate.initUndefined()) catch {};
+    self.setObjectProperty(context, this, closed_key, self.env.isolate.initTrue()) catch {};
+}
+
+fn invokeSetViewport(self: *Runtime, info: *const v8.FunctionCallbackInfo) void {
+    var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const context = v8.v8__Isolate__GetCurrentContext(self.env.isolate.handle) orelse {
+        return self.throwError("internal: missing callback context");
+    };
+    const this = v8.v8__FunctionCallbackInfo__This(info) orelse {
+        return self.throwError("internal: missing receiver");
+    };
+
+    if (self.isReceiverClosed(context, this)) {
+        return self.throwError("page has been closed");
+    }
+    if (self.receiverFrameId(context, info)) |frame_id| {
+        if (self.session.findFrameByFrameId(frame_id) == null) {
+            return self.throwError("page handle is no longer valid; the page was closed");
+        }
+    }
+
+    const parsed = self.parseSetViewportArgs(arena, context, info) catch |err| switch (err) {
+        error.OutOfMemory => return self.throwError("out of memory"),
+        error.JsException => return,
+        error.InvalidArguments => return self.throwTypeError("invalid arguments"),
+    };
+
+    self.session.browser.env.isolate.enter();
+    defer self.session.browser.env.isolate.exit();
+    const current = self.session.browser.getViewport();
+    self.session.browser.setViewportOverride(.{
+        .width = parsed.width,
+        .height = parsed.height,
+        .scale = parsed.scale orelse current.scale,
+        .screen_width = current.screen_width,
+        .screen_height = current.screen_height,
+    });
+}
+
+const ViewportArgs = struct {
+    width: u32,
+    height: u32,
+    scale: ?f32 = null,
+};
+
+fn parseSetViewportArgs(
+    self: *Runtime,
+    arena: std.mem.Allocator,
+    context: *const v8.Context,
+    info: *const v8.FunctionCallbackInfo,
+) BuildArgsError!ViewportArgs {
+    const argc: usize = @intCast(v8.v8__FunctionCallbackInfo__Length(info));
+    if (argc < 1 or argc > 3) return error.InvalidArguments;
+
+    const first = try self.argJson(arena, context, info, 0);
+    if (argc == 1) {
+        if (first != .object) return error.InvalidArguments;
+        const obj = first.object;
+        var it = obj.iterator();
+        while (it.next()) |entry| {
+            const k = entry.key_ptr.*;
+            if (!std.mem.eql(u8, k, "width") and !std.mem.eql(u8, k, "height") and !std.mem.eql(u8, k, "deviceScaleFactor")) {
+                return error.InvalidArguments;
+            }
+        }
+        const width = try parseViewportDim(obj.get("width") orelse return error.InvalidArguments);
+        const height = try parseViewportDim(obj.get("height") orelse return error.InvalidArguments);
+        const scale = if (obj.get("deviceScaleFactor")) |dsf| try parseViewportScale(dsf) else null;
+        return .{ .width = width, .height = height, .scale = scale };
+    }
+
+    const width = try parseViewportDim(first);
+    const height = try parseViewportDim(try self.argJson(arena, context, info, 1));
+    var scale: ?f32 = null;
+    if (argc == 3) {
+        const third = try self.argJson(arena, context, info, 2);
+        if (third != .null) {
+            if (third != .object) return error.InvalidArguments;
+            var it = third.object.iterator();
+            while (it.next()) |entry| {
+                const k = entry.key_ptr.*;
+                if (!std.mem.eql(u8, k, "deviceScaleFactor")) {
+                    return error.InvalidArguments;
+                }
+            }
+            if (third.object.get("deviceScaleFactor")) |dsf| {
+                scale = try parseViewportScale(dsf);
+            }
+        }
+    }
+    return .{ .width = width, .height = height, .scale = scale };
+}
+
+fn parseViewportDim(val: std.json.Value) error{InvalidArguments}!u32 {
+    return switch (val) {
+        .integer => |v| if (v >= 1 and v <= 10_000_000) @intCast(v) else error.InvalidArguments,
+        .float => |v| blk: {
+            if (!std.math.isFinite(v) or @floor(v) != v or v < 1.0 or v > 10_000_000.0) {
+                break :blk error.InvalidArguments;
+            }
+            break :blk @intFromFloat(v);
+        },
+        else => error.InvalidArguments,
+    };
+}
+
+fn parseViewportScale(val: std.json.Value) error{InvalidArguments}!?f32 {
+    return switch (val) {
+        .null => null,
+        .integer => |v| if (v > 0 and v <= 1000) @floatFromInt(v) else error.InvalidArguments,
+        .float => |v| if (std.math.isFinite(v) and v > 0.0 and v <= 1000.0) @floatCast(v) else error.InvalidArguments,
+        else => error.InvalidArguments,
+    };
+}
+
+fn isReceiverClosed(self: *Runtime, context: *const v8.Context, this: *const v8.Object) bool {
+    const key: *const v8.Value = @ptrCast(self.env.isolate.initStringHandle(closed_key) catch return false);
+    const prop = v8.v8__Object__Get(this, context, key) orelse return false;
+    return v8.v8__Value__IsTrue(prop);
 }
 
 fn invoke(self: *Runtime, tool: BrowserTool, info: *const v8.FunctionCallbackInfo) void {
@@ -818,6 +960,7 @@ fn rejectResolver(self: *Runtime, context: *const v8.Context, resolver: *const v
 fn bindFrameId(self: *Runtime, context: *const v8.Context, this: *const v8.Object, frame_id: u32) InitError!void {
     const value = v8.v8__Integer__NewFromUnsigned(self.env.isolate.handle, frame_id) orelse
         return error.RuntimeInitFailed;
+    try self.setObjectProperty(context, this, closed_key, self.env.isolate.initUndefined());
     return self.setObjectProperty(context, this, frame_id_key, @ptrCast(value));
 }
 
@@ -1994,4 +2137,82 @@ test "agent script runtime: top-level await runs in an async wrapper" {
         \\return x + 2;
     );
     try testing.expectString("42\n", sink.written());
+}
+
+test "agent script runtime: page.setViewport updates dimensions before and after goto" {
+    defer testing.test_session.closeAllPages();
+    defer testing.test_session.browser.setViewportOverride(null);
+
+    var registry = NodeRegistry.init(testing.allocator);
+    defer registry.deinit();
+
+    const runtime = try Runtime.init(testing.allocator, testing.test_app, testing.test_session, &registry);
+    defer runtime.deinit();
+
+    var sink: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer sink.deinit();
+    runtime.result_sink = &sink.writer;
+
+    try runTestScript(runtime,
+        \\const page = new Page();
+        \\page.setViewport(375, 667, { deviceScaleFactor: 2 });
+        \\await page.goto("http://localhost:9582/src/browser/tests/mcp_actions.html");
+        \\const before = JSON.parse(page.evaluate("JSON.stringify([window.innerWidth, window.innerHeight, window.devicePixelRatio])"));
+        \\page.setViewport({ width: 1440, height: 900, deviceScaleFactor: 1.5 });
+        \\const after = JSON.parse(page.evaluate("JSON.stringify([window.innerWidth, window.innerHeight, window.devicePixelRatio])"));
+        \\return { before, after };
+    );
+    try testing.expectString("{\"before\":[375,667,2],\"after\":[1440,900,1.5]}\n", sink.written());
+
+    const invalid = (try runtime.runSource(
+        \\const page = new Page();
+        \\page.setViewport(0, 600);
+    , "agent-runtime-invalid-viewport.js")).?;
+    try testing.expect(std.mem.find(u8, invalid, "invalid arguments") != null);
+}
+
+test "agent script runtime: page.scroll delivers IntersectionObserver transitions synchronously" {
+    testing.test_session.experimental_features.layout_intersection = true;
+    defer testing.test_session.experimental_features = .{};
+    defer testing.test_session.closeAllPages();
+
+    var registry = NodeRegistry.init(testing.allocator);
+    defer registry.deinit();
+
+    const runtime = try Runtime.init(testing.allocator, testing.test_app, testing.test_session, &registry);
+    defer runtime.deinit();
+
+    var sink: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer sink.deinit();
+    runtime.result_sink = &sink.writer;
+
+    try runTestScript(runtime,
+        \\const page = new Page();
+        \\await page.goto("http://localhost:9582/src/browser/tests/mcp_actions.html");
+        \\page.evaluate(`
+        \\  const scroller = document.createElement('div');
+        \\  scroller.id = 'ioScroller';
+        \\  scroller.style.height = '200px';
+        \\  scroller.style.overflowY = 'auto';
+        \\  for (let i = 0; i < 4; i++) {
+        \\    const item = document.createElement('div');
+        \\    item.id = 'item-' + i;
+        \\    item.style.height = '150px';
+        \\    scroller.appendChild(item);
+        \\  }
+        \\  document.body.appendChild(scroller);
+        \\  window.ioSeen = [];
+        \\  const io = new IntersectionObserver((entries) => {
+        \\    for (const e of entries) {
+        \\      if (e.isIntersecting) window.ioSeen.push(e.target.id);
+        \\    }
+        \\  }, { root: scroller });
+        \\  for (const el of scroller.children) io.observe(el);
+        \\`);
+        \\const initial = JSON.parse(page.evaluate("JSON.stringify(window.ioSeen)"));
+        \\page.scroll({ selector: "#ioScroller", y: 320 });
+        \\const after = JSON.parse(page.evaluate("JSON.stringify(window.ioSeen)"));
+        \\return { initial, after };
+    );
+    try testing.expectString("{\"initial\":[\"item-0\",\"item-1\"],\"after\":[\"item-0\",\"item-1\",\"item-2\",\"item-3\"]}\n", sink.written());
 }

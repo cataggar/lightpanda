@@ -128,6 +128,10 @@ _fragment_scripts_runnable: bool = false,
 // File objects (reference counted via their Blob proto); released at teardown.
 _file_lists: std.ArrayList(*FileList) = .empty,
 
+// Monotonic stamp bumped on box-moving mutations (including inert inline style
+// writes and scrolls) so cached flow extents invalidate accurately.
+_box_layout_version: usize = 0,
+
 // List of Documents which called document.open() and potentially need to have
 // the parser freed.
 _script_created_parser_docs: std.ArrayList(*Document) = .empty,
@@ -582,7 +586,20 @@ pub fn resetLocalArena(self: *Frame) void {
     self._local_arena.reset(if (comptime lp.IS_DEBUG) 0 else JS.Caller.LOCAL_ARENA_RETAIN);
 }
 
+pub fn layoutIntersectionEnabled(self: *const Frame) bool {
+    return self._session.experimental_features.layout_intersection;
+}
+
 pub fn viewportChanged(self: *Frame) void {
+    if (self.layoutIntersectionEnabled()) {
+        self._box_layout_version +%= 1;
+        if (Frame.observers.hasIntersectionObservers(self)) {
+            self._intersection.recheck_all = true;
+            Frame.observers.scheduleIntersectionChecks(self);
+        }
+    }
+    self._style_manager.sheetModified();
+    Frame.observers.scheduleResizeChecks(self);
     var i: usize = 0;
     while (i < self._media_query_lists.items.len) : (i += 1) {
         self._media_query_lists.items[i].viewportChanged();
@@ -590,6 +607,9 @@ pub fn viewportChanged(self: *Frame) void {
     i = 0;
     while (i < self.child_frames.items.len) : (i += 1) {
         self.child_frames.items[i].viewportChanged();
+    }
+    if (self._type == .root) {
+        self.js.env.runMicrotasks();
     }
 }
 
@@ -1381,6 +1401,7 @@ fn neuter(self: *Frame) void {
         child.neuter();
     }
     self.window._closed = true;
+    observers.frameNeutered(self);
     self.abortDocumentLoad();
     self.cancelQueuedNavigation();
     user_input.forgetFrame(self);

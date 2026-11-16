@@ -197,7 +197,7 @@ fn writePandascriptBuiltins(w: *Writer) Writer.Error!void {
 
     try w.writeAll("## Page lifecycle\n\n" ++ table_head);
     for (lp.Runtime.page_methods) |m| {
-        try w.print("| `{s}` | `page.{s}()` | {f} | {f} |\n", .{ m.name, m.name, Cell{ .s = m.returns }, Cell{ .s = m.summary } });
+        try w.print("| `{s}` | `{s}` | {f} | {f} |\n", .{ m.name, m.call, Cell{ .s = m.returns }, Cell{ .s = m.summary } });
     }
 
     try w.writeAll("\n## Console\n\n| Method | Writes to |\n|---|---|\n");
@@ -443,8 +443,8 @@ test "docs: pandascript-builtins lists exactly the recorded tools" {
     // No signature takes a node id; the one mention is what `waitForSelector` returns.
     try testing.expectEqual(1, std.mem.count(u8, out, "backendNodeId"));
     for (lp.Runtime.page_methods) |m| {
-        var buf: [64]u8 = undefined;
-        try testing.expect(std.mem.find(u8, out, try std.mem.print(&buf, "`page.{s}()`", .{m.name})) != null);
+        var buf: [96]u8 = undefined;
+        try testing.expect(std.mem.find(u8, out, try std.mem.print(&buf, "`{s}`", .{m.call})) != null);
     }
     try testing.expect(std.mem.find(u8, out, "| `console.warn` | stderr |") != null);
 }

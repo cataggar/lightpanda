@@ -174,6 +174,10 @@ user_agent_override: ?[:0]const u8 = null,
 // Drives both the request header and navigator.languages.
 accept_language_override: ?lp.Config.HttpHeaders.AcceptLanguage = null,
 
+// Network throttling and offline state set via CLI flags or CDP
+// Network.emulateNetworkConditions. Throughput values <= 0 mean unlimited.
+network_conditions: NetworkConditions = .{},
+
 // The driver (CDP / BiDi) attached to us. If there's a driver, then there's
 // an inbox for us to process (and there's someone to wake us up from a poll)
 driver: ?Driver = null,
@@ -213,6 +217,23 @@ http_version: lp.Config.HttpVersion,
 robots: RobotsGate,
 cors: CorsGate,
 url_blocklist: ?UrlBlocklist,
+
+pub const NetworkConditions = struct {
+    offline: bool = false,
+    latency_ms: u64 = 0,
+    download_throughput: i64 = -1,
+    upload_throughput: i64 = -1,
+
+    pub fn fromConfig(config: *const lp.Config) NetworkConditions {
+        const recv_speed = config.httpMaxRecvSpeed();
+        return .{
+            .offline = false,
+            .latency_ms = config.httpLatency(),
+            .download_throughput = if (recv_speed > 0) @intCast(@min(recv_speed, std.math.maxInt(i64))) else -1,
+            .upload_throughput = -1,
+        };
+    }
+};
 
 pub fn init(self: *Client, app: *lp.App) !void {
     const config = app.config;
@@ -255,6 +276,7 @@ pub fn init(self: *Client, app: *lp.App) !void {
         .obey_robots = config.obeyRobots(),
         .http_version = config.httpVersion(),
         .obey_cors = config.obeyCors(),
+        .network_conditions = NetworkConditions.fromConfig(config),
         .robots = .{
             .network = network,
             .single_flight = .init(allocator),
@@ -340,6 +362,14 @@ pub fn clearAcceptLanguageOverride(self: *Client) void {
         override.deinit(self.allocator);
         self.accept_language_override = null;
     }
+}
+
+pub fn setNetworkConditions(self: *Client, conditions: NetworkConditions) void {
+    self.network_conditions = conditions;
+}
+
+pub fn resetNetworkConditions(self: *Client) void {
+    self.network_conditions = NetworkConditions.fromConfig(self.network.config);
 }
 
 // Enable TLS verification on all connections.
@@ -759,6 +789,7 @@ pub fn newRequest(self: *Client, req: Request, owner: ?*Owner) anyerror!*Transfe
             .cookie_jar = cookie_jar,
             .cookie_origin = cookie_origin,
             .client = self,
+            .allow_ua_override = self.network.config.experimentalFeatures().ua_override,
             .arena = arena,
             .res = .{
                 .buffer = .init(self.allocator),
@@ -1164,6 +1195,11 @@ fn pipeline(self: *Client, transfer: *Transfer, from: SubmitFrom) !void {
 
             // Internal transfers (robots.txt, the CORS preflight fetch) are
             // browser bookkeeping, not a page-chosen destination.
+            if (transfer.req.internal == false and self.network_conditions.offline) {
+                log.debug(.http, "offline emulated", .{ .url = transfer.req.url });
+                return transfer.failAsync(error.InternetDisconnected);
+            }
+
             if (transfer.req.internal == false and http.isBadPortUrl(transfer.req.url)) {
                 log.info(.http, "blocked unsafe port", .{ .url = transfer.req.url });
                 return transfer.failAsync(error.UnsafePort);
@@ -1213,17 +1249,24 @@ fn pipeline(self: *Client, transfer: *Transfer, from: SubmitFrom) !void {
             // Last because we only want to reserve a slot for a request we
             // intend to actually send out (e.g. not cached, not blocked by
             // robots, not answered by request intercetion)
+            var delay_ms: u64 = 0;
+            const now = lp.datetime.milliTimestamp(.boot);
             if (transfer.req.throttle) {
                 if (self.network.rate_limiter) |*rl| {
-                    const now = lp.datetime.milliTimestamp(.boot);
-                    const run_at = try rl.reserve(URL.getHostname(transfer.req.url), now);
-                    if (run_at > now) {
-                        const d = run_at - now;
+                    const rl_run_at = try rl.reserve(URL.getHostname(transfer.req.url), now);
+                    if (rl_run_at > now) {
+                        const d = rl_run_at - now;
                         lp.metrics.http_navigation_delay_ms.observe(@intCast(d));
                         log.debug(.http, "navigation delayed", .{ .url = transfer.req.url, .ms = d });
-                        return self.delay(transfer, run_at);
+                        delay_ms = d;
                     }
                 }
+            }
+            if (!transfer.req.internal and self.network_conditions.latency_ms > 0) {
+                delay_ms +|= self.network_conditions.latency_ms;
+            }
+            if (delay_ms > 0) {
+                return self.delay(transfer, now +| delay_ms);
             }
             continue :sw SubmitFrom.network;
         },
@@ -2698,6 +2741,7 @@ pub const Transfer = struct {
     req: Request,
     res: Response = .{},
     client: *Client,
+    allow_ua_override: bool = false,
 
     // The owner's jar, unless the request opted out of cookies.
     cookie_jar: ?*CookieJar = null,
@@ -4025,6 +4069,17 @@ pub const Transfer = struct {
             try conn.setTimeout(0);
         }
 
+        const max_recv: u64 = if (!req.internal and client.network_conditions.download_throughput > 0)
+            @intCast(client.network_conditions.download_throughput)
+        else
+            0;
+        const max_send: u64 = if (!req.internal and client.network_conditions.upload_throughput > 0)
+            @intCast(client.network_conditions.upload_throughput)
+        else
+            0;
+        try conn.setMaxRecvSpeed(max_recv);
+        try conn.setMaxSendSpeed(max_send);
+
         if (self._proxy_credentials) |creds| {
             try conn.setProxyCredentials(creds);
         }
@@ -4326,7 +4381,7 @@ pub const Transfer = struct {
     }
 
     fn putHeader(self: *Transfer, name: []const u8, value: []const u8, source: HeaderSource, mode: enum { set, append }) !void {
-        if (verifyHeader(name, value) == false) {
+        if (self.verifyHeader(name, value) == false) {
             return;
         }
 
@@ -4366,9 +4421,9 @@ pub const Transfer = struct {
 
     // Central gate for every header entering req_headers; name-keyed
     // restrictions live here so entry points don't need their own checks.
-    fn verifyHeader(name: []const u8, value: []const u8) bool {
+    fn verifyHeader(self: *const Transfer, name: []const u8, value: []const u8) bool {
         if (std.ascii.eqlIgnoreCase(name, "user-agent")) {
-            lp.Config.validateUserAgent(value) catch |err| {
+            lp.Config.validateUserAgentWithOpts(value, self.allow_ua_override) catch |err| {
                 log.debug(.http, "invalid header dropped", .{ .name = name, .err = err });
                 return false;
             };
@@ -5332,6 +5387,7 @@ fn initTestClient(client: *Client, pool: *ArenaPool) void {
     };
     client.url_blocklist = null;
     client.accept_language_override = null;
+    client.network_conditions = .{};
     client.test_fail_submit = null;
     // isUrlBlocked reaches through here for the adblocker; tests that want
     // one assign it to `client.network` after this returns.
@@ -5613,6 +5669,23 @@ test "HttpClient: Transfer.setHeader replaces by case-insensitive name" {
     try testing.expectEqual(.author, headers[1].source);
     try testing.expectEqual("X-New", headers[2].name);
     try testing.expectEqual("yes", headers[2].value);
+}
+
+test "HttpClient: Transfer.setHeader honors allow_ua_override for Mozilla User-Agent" {
+    var pool = ArenaPool.init(testing.allocator, .{});
+    defer pool.deinit();
+
+    const arena = try pool.acquire(.small, "test");
+    defer arena.release();
+
+    var transfer = testTransfer(arena);
+    try transfer.setHeader("User-Agent", "Mozilla/5.0 Test/1.0", .{});
+    try testing.expectEqual(@as(usize, 0), transfer.req_headers.items.len);
+
+    transfer.allow_ua_override = true;
+    try transfer.setHeader("User-Agent", "Mozilla/5.0 Test/1.0", .{});
+    try testing.expectEqual(@as(usize, 1), transfer.req_headers.items.len);
+    try testing.expectEqual("Mozilla/5.0 Test/1.0", transfer.req_headers.items[0].value);
 }
 
 test "HttpClient: Transfer.botChallenge" {
