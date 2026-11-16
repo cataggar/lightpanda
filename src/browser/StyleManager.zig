@@ -2164,6 +2164,45 @@ pub fn inlineMargins(self: *StyleManager, el: *Element, containing_width: ?f64) 
     return self.inlineSum(geometry.margin_left, geometry.margin_right, containing_width);
 }
 
+pub const InsetOffsets = struct {
+    top: ?f64 = null,
+    right: ?f64 = null,
+    bottom: ?f64 = null,
+    left: ?f64 = null,
+};
+
+fn resolveInsetSide(length: Length, viewport: Viewport, containing_size: f64) ?f64 {
+    return length.resolve(viewport) orelse switch (length.unit) {
+        .percent => @as(f64, length.value) / 100.0 * containing_size,
+        else => null,
+    };
+}
+
+/// Resolved positioned inset offsets (`top`, `right`, `bottom`, `left`) in px,
+/// with percentages resolved against `(containing_width, containing_height)`
+/// and `auto` / unresolved lengths returned as `null`.
+pub fn insetOffsets(self: *StyleManager, el: *Element, containing_width: f64, containing_height: f64) InsetOffsets {
+    self.assertOwns(el);
+    self.rebuildIfDirty() catch return .{};
+    const geometry = self.geometryProps(el);
+    const viewport = self.frame.page.getViewport();
+    return .{
+        .top = resolveInsetSide(geometry.top, viewport, containing_height),
+        .right = resolveInsetSide(geometry.right, viewport, containing_width),
+        .bottom = resolveInsetSide(geometry.bottom, viewport, containing_height),
+        .left = resolveInsetSide(geometry.left, viewport, containing_width),
+    };
+}
+
+/// Fraction of the containing block's height when `height` is a percentage,
+/// `null` otherwise.
+pub fn heightPercent(self: *StyleManager, el: *Element) ?f64 {
+    self.assertOwns(el);
+    self.rebuildIfDirty() catch return null;
+    const height = self.geometryProps(el).height;
+    return if (height.unit == .percent) @as(f64, height.value) / 100.0 else null;
+}
+
 /// The left and right offsets of a positioned box, 0 for one in flow. A
 /// percentage resolves against the containing block's width.
 pub fn inlineInsets(self: *StyleManager, el: *Element, containing_width: f64) f64 {
@@ -2326,6 +2365,14 @@ pub fn clipsOverflowX(self: *StyleManager, el: *Element) bool {
     self.assertOwns(el);
     self.rebuildIfDirty() catch return false;
     return self.geometryProps(el).overflow_x_clips;
+}
+
+/// Overflow along y is clipped or scrolled within the box, so it doesn't
+/// extend the ancestors' scrollable height.
+pub fn clipsOverflowY(self: *StyleManager, el: *Element) bool {
+    self.assertOwns(el);
+    self.rebuildIfDirty() catch return false;
+    return self.geometryProps(el).overflow_y_clips;
 }
 
 pub const WidthLimit = union(enum) {
@@ -3666,13 +3713,14 @@ const Visibility = struct {
 /// An element's box: its size and how it scrolls.
 const Geometry = struct {
     const Declared = struct {
-        const names = [_][]const u8{ "overflow-x", "overflow-y", "overscroll-behavior-x", "overscroll-behavior-y", "width", "height", "min-width", "max-width", "flex", "flex-grow", "flex-shrink", "margin", "margin-inline", "margin-left", "margin-right", "margin-inline-start", "margin-inline-end", "inset", "inset-inline", "left", "right", "inset-inline-start", "inset-inline-end" };
+        const names = [_][]const u8{ "overflow-x", "overflow-y", "overscroll-behavior-x", "overscroll-behavior-y", "width", "height", "min-width", "max-width", "flex", "flex-grow", "flex-shrink", "margin", "margin-inline", "margin-left", "margin-right", "margin-inline-start", "margin-inline-end", "inset", "inset-inline", "inset-block", "left", "right", "top", "bottom", "inset-inline-start", "inset-inline-end", "inset-block-start", "inset-block-end" };
 
         overflow_x_scrolls: ?bool = null,
         overflow_x_clips: ?bool = null,
         flex_grow: ?bool = null,
         flex_no_shrink: ?bool = null,
         overflow_y_scrolls: ?bool = null,
+        overflow_y_clips: ?bool = null,
         overscroll_x_contains: ?bool = null,
         overscroll_y_contains: ?bool = null,
         width: ?Length = null,
@@ -3683,6 +3731,8 @@ const Geometry = struct {
         margin_right: ?Length = null,
         left: ?Length = null,
         right: ?Length = null,
+        top: ?Length = null,
+        bottom: ?Length = null,
 
         fn apply(self: *Declared, id: properties.Id, value: []const u8) void {
             switch (id) {
@@ -3714,19 +3764,32 @@ const Geometry = struct {
                 },
                 .inset => {
                     const sides = boxSides(value) orelse return;
-                    self.left = sides.left;
+                    self.top = sides.top;
                     self.right = sides.right;
+                    self.bottom = sides.bottom;
+                    self.left = sides.left;
                 },
                 .@"inset-inline" => {
                     const sides = inlineSides(value) orelse return;
                     self.left = sides.left;
                     self.right = sides.right;
                 },
+                .@"inset-block" => {
+                    const sides = inlineSides(value) orelse return;
+                    self.top = sides.left;
+                    self.bottom = sides.right;
+                },
                 .left, .@"inset-inline-start" => {
                     self.left = Length.parseMargin(value);
                 },
                 .right, .@"inset-inline-end" => {
                     self.right = Length.parseMargin(value);
+                },
+                .top, .@"inset-block-start" => {
+                    self.top = Length.parseMargin(value);
+                },
+                .bottom, .@"inset-block-end" => {
+                    self.bottom = Length.parseMargin(value);
                 },
                 .@"margin-left", .@"margin-inline-start" => {
                     self.margin_left = Length.parseMargin(value);
@@ -3736,6 +3799,7 @@ const Geometry = struct {
                 },
                 .@"overflow-y" => {
                     self.overflow_y_scrolls = overflowScrolls(value);
+                    self.overflow_y_clips = overflowClips(value);
                 },
                 .@"overscroll-behavior-x" => {
                     self.overscroll_x_contains = overscrollContains(value);
@@ -3759,11 +3823,12 @@ const Geometry = struct {
             }
         }
 
+        const BoxSides = struct { top: Length, right: Length, bottom: Length, left: Length };
         const Sides = struct { left: Length, right: Length };
 
-        // The left and right of a `top [right [bottom [left]]]` shorthand
+        // The four sides of a `top [right [bottom [left]]]` shorthand
         // (margin, inset).
-        fn boxSides(value: []const u8) ?Sides {
+        fn boxSides(value: []const u8) ?BoxSides {
             var count: usize = 0;
             var tokens: [4][]const u8 = undefined;
             var it = std.mem.tokenizeAny(u8, value, &std.ascii.whitespace);
@@ -3776,10 +3841,15 @@ const Geometry = struct {
             if (count == 0) {
                 return null;
             }
+            const top = tokens[0];
             const right = tokens[@min(count - 1, 1)];
+            const bottom = if (count >= 3) tokens[2] else top;
+            const left = if (count == 4) tokens[3] else right;
             return .{
-                .left = Length.parseMargin(if (count == 4) tokens[3] else right),
+                .top = Length.parseMargin(top),
                 .right = Length.parseMargin(right),
+                .bottom = Length.parseMargin(bottom),
+                .left = Length.parseMargin(left),
             };
         }
 
@@ -3850,12 +3920,13 @@ const Geometry = struct {
         }
     };
 
-    const Computed = packed struct(u287) {
+    const Computed = packed struct(u358) {
         overflow_x_scrolls: bool = false,
         overflow_x_clips: bool = false,
         flex_grow: bool = false,
         flex_no_shrink: bool = false,
         overflow_y_scrolls: bool = false,
+        overflow_y_clips: bool = false,
         overscroll_x_contains: bool = false,
         overscroll_y_contains: bool = false,
         width: Length = .{},
@@ -3869,6 +3940,8 @@ const Geometry = struct {
         // Positioned boxes only; auto, and values that need layout, are auto
         left: Length = .{},
         right: Length = .{},
+        top: Length = .{},
+        bottom: Length = .{},
     };
 
     // Memory optimization. We usedto store each value as a
@@ -3877,14 +3950,14 @@ const Geometry = struct {
     // struct of arrays ("specialized", because the unit is bit-packed into bits)
     const Stored = struct {
         values: [length_count]f32,
-        bits: u32,
+        bits: u64 align(4),
 
         const names = @typeInfo(Computed).@"struct".field_names;
         const types = @typeInfo(Computed).@"struct".field_types;
         const length_count = std.mem.count(type, types, &.{Length});
 
         comptime {
-            std.debug.assert(length_count * @bitSizeOf(Length.Unit) + (names.len - length_count) <= 32);
+            std.debug.assert(length_count * @bitSizeOf(Length.Unit) + (names.len - length_count) <= 64);
         }
 
         fn pack(computed: Computed) Stored {
@@ -3895,11 +3968,11 @@ const Geometry = struct {
                 const value = @field(computed, name);
                 if (T == Length) {
                     stored.values[length] = value.value;
-                    stored.bits |= @as(u32, @backingInt(value.unit)) << bit;
+                    stored.bits |= @as(u64, @backingInt(value.unit)) << bit;
                     length += 1;
                     bit += @bitSizeOf(Length.Unit);
                 } else {
-                    stored.bits |= @as(u32, @intFromBool(value)) << bit;
+                    stored.bits |= @as(u64, @intFromBool(value)) << bit;
                     bit += 1;
                 }
             }
@@ -5283,11 +5356,11 @@ test "StyleManager: inlineDeclared: scan matches the parsed style object" {
         .{ .visibility = .{ .visibility_hidden = true } },
         .{},
         .{},
-        .{ .geometry = .{ .overflow_x_scrolls = true, .overflow_x_clips = true, .overflow_y_scrolls = true } },
-        .{ .geometry = .{ .overflow_x_scrolls = false, .overflow_x_clips = true, .overflow_y_scrolls = true } },
-        .{ .geometry = .{ .overflow_x_scrolls = false, .overflow_x_clips = true, .overflow_y_scrolls = true } },
-        .{ .geometry = .{ .overflow_x_scrolls = false, .overflow_x_clips = true, .overflow_y_scrolls = false } },
-        .{ .geometry = .{ .overflow_x_scrolls = false, .overflow_x_clips = true, .overflow_y_scrolls = true } },
+        .{ .geometry = .{ .overflow_x_scrolls = true, .overflow_x_clips = true, .overflow_y_scrolls = true, .overflow_y_clips = true } },
+        .{ .geometry = .{ .overflow_x_scrolls = false, .overflow_x_clips = true, .overflow_y_scrolls = true, .overflow_y_clips = true } },
+        .{ .geometry = .{ .overflow_x_scrolls = false, .overflow_x_clips = true, .overflow_y_scrolls = true, .overflow_y_clips = true } },
+        .{ .geometry = .{ .overflow_x_scrolls = false, .overflow_x_clips = true, .overflow_y_scrolls = false, .overflow_y_clips = true } },
+        .{ .geometry = .{ .overflow_x_scrolls = false, .overflow_x_clips = true, .overflow_y_scrolls = true, .overflow_y_clips = true } },
         .{ .geometry = .{ .overflow_x_scrolls = true, .overflow_x_clips = true } },
         .{},
         .{ .geometry = .{ .width = .{ .value = 100, .unit = .px }, .height = .{ .value = 96, .unit = .px } } },
@@ -6259,7 +6332,7 @@ test "StyleManager: records: a group allocates the chunks it reaches" {
 }
 
 test "StyleManager: records: geometry packs its lengths' units with the flags" {
-    try testing.expectEqual(40, @sizeOf(Records(Geometry.Stored).Entry));
+    try testing.expectEqual(52, @sizeOf(Records(Geometry.Stored).Entry));
 
     // Each field apart from its neighbours
     const names = Geometry.Stored.names;

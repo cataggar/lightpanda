@@ -28,44 +28,64 @@ _pad: bool = false,
 
 pub const init: CSS = .{};
 
-// Extract the X value from a transfrom. This could come from a translate,
-// translatex, translate3d or matrix function.
-pub fn parseTranslateX(value: []const u8) f64 {
-    var total: f64 = 0.0;
+pub const TranslateOffset = struct {
+    x: f64 = 0.0,
+    y: f64 = 0.0,
+};
+
+// Extract the X and Y values from a transform (`translate`, `translateX`,
+// `translateY`, `translate3d`, `matrix`, or `matrix3d`).
+pub fn parseTranslateXY(value: []const u8) TranslateOffset {
+    var total: TranslateOffset = .{};
     var tokenizer: Tokenizer = .{ .input = value };
     while (tokenizer.next()) |token| {
         const name = switch (token) {
             .function => |name| name,
             else => continue,
         };
-        const x_arg: usize = blk: {
-            if (std.ascii.eqlIgnoreCase(name, "translatex") or std.ascii.eqlIgnoreCase(name, "translate") or std.ascii.eqlIgnoreCase(name, "translate3d")) {
-                // x is the first arg in all these cases
-                break :blk 0;
-            }
-            if (std.ascii.eqlIgnoreCase(name, "matrix")) {
-                // x is the 4th arg in the matrix
-                break :blk 4;
-            }
+        var x_arg: ?usize = null;
+        var y_arg: ?usize = null;
+        if (std.ascii.eqlIgnoreCase(name, "translatex")) {
+            x_arg = 0;
+        } else if (std.ascii.eqlIgnoreCase(name, "translatey")) {
+            y_arg = 0;
+        } else if (std.ascii.eqlIgnoreCase(name, "translate") or std.ascii.eqlIgnoreCase(name, "translate3d")) {
+            x_arg = 0;
+            y_arg = 1;
+        } else if (std.ascii.eqlIgnoreCase(name, "matrix")) {
+            x_arg = 4;
+            y_arg = 5;
+        } else if (std.ascii.eqlIgnoreCase(name, "matrix3d")) {
+            x_arg = 12;
+            y_arg = 13;
+        } else {
             continue;
-        };
+        }
 
         var arg: usize = 0;
         while (tokenizer.next()) |t| {
             switch (t) {
                 .close_parenthesis => break,
                 .comma => arg += 1,
-                .number => |n| if (arg == x_arg) {
-                    total += n.value;
+                .number => |n| {
+                    if (x_arg == arg) total.x += n.value;
+                    if (y_arg == arg) total.y += n.value;
                 },
-                .dimension => |d| if (arg == x_arg and std.ascii.eqlIgnoreCase(d.unit, "px")) {
-                    total += d.value;
+                .dimension => |d| if (std.ascii.eqlIgnoreCase(d.unit, "px")) {
+                    if (x_arg == arg) total.x += d.value;
+                    if (y_arg == arg) total.y += d.value;
                 },
                 else => {},
             }
         }
     }
     return total;
+}
+
+// Extract the X value from a transform. This could come from a translate,
+// translatex, translate3d or matrix function.
+pub fn parseTranslateX(value: []const u8) f64 {
+    return parseTranslateXY(value).x;
 }
 
 /// Escapes a CSS identifier string

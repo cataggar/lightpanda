@@ -500,12 +500,20 @@
     \\                           animationcancel for CSS animations, for pages
     \\                           that wait on them. Initial implementation can
     \\                           be CPU-heavy.
+    \\             layout_intersection
+    \\                           Evaluate IntersectionObserver against layout
+    \\                           geometry and scroll offsets, firing transition
+    \\                           entries as targets scroll into or out of view.
     \\             privatecache  Let the HTTP cache (--http-cache-dir) store
     \\                           responses with a Set-Cookie header, removing
     \\                           the header. The cache and the cookie store
     \\                           have different lifetimes and are shared
     \\                           differently, so a cached response without its
     \\                           Set-Cookie can make later requests fail.
+    \\             ua_override   Allow arbitrary User-Agent values (including
+    \\                           "Mozilla/*") via --user-agent, --http-header,
+    \\                           Emulation.setUserAgentOverride, and
+    \\                           Network.setExtraHTTPHeaders.
     \\  --load-resources <RESOURCE>
     \\          Sub-resource to actually request. Can be passed multiple times.
     \\          Defaults to stylesheet for mcp and agent, and to none of them
@@ -562,6 +570,10 @@
     \\          internal one. You should not replace internally set headers without knowing
     \\          perfectly well what you are doing.
     \\          Script set headers via CDP or JS can't override a CLI set header.
+    \\  --http-latency <INT>
+    \\          Artificial latency in ms added before starting each outgoing HTTP
+    \\          request. 0 disables the delay.
+    \\          Defaults to 0.
     \\  --http-max-concurrent <INT>
     \\          Maximum number of concurrent HTTP requests, shared by every
     \\          session.
@@ -570,6 +582,11 @@
     \\  --http-max-host-open <INT>
     \\          Maximum open connections to a given host:port.
     \\          Defaults to 6.
+    \\  --http-max-recv-speed <INT>
+    \\          Maximum HTTP download throughput in bytes per second, paced per
+    \\          transfer via libcurl (CURLOPT_MAX_RECV_SPEED_LARGE). 0 means
+    \\          unlimited.
+    \\          Defaults to 0.
     \\  --http-max-response-size <INT>
     \\          Limits the acceptable response size for any request
     \\          e.g. XHR, fetch, script loading.
@@ -637,8 +654,9 @@
     \\          Defaults to the host time zone.
     \\  --user-agent <STRING>
     \\          Override the User-Agent header entirely. Must not impersonate other
-    \\          browsers; any value containing "Mozilla" is forbidden. The browser
-    \\          still sends Sec-Ch-Ua. Incompatible with --user-agent-suffix.
+    \\          browsers; any value containing "Mozilla" is forbidden unless
+    \\          --experimental-features ua_override is enabled. The browser still
+    \\          sends Sec-Ch-Ua. Incompatible with --user-agent-suffix.
     \\  --user-agent-suffix <STRING>
     \\          Suffix appended to the Lightpanda/X.Y User-Agent.
     \\  --v8-flags-unsafe <FLAGS>
@@ -657,6 +675,10 @@
     \\          Maximum V8 heap size in megabytes, per browser instance. Values
     \\          below ~16 are clamped by V8 and all behave the same.
     \\          Defaults to the V8 default (based on available memory).
+    \\  --viewport <WIDTHxHEIGHT>
+    \\          Initial viewport dimensions in CSS pixels, e.g. 1920x1080 or
+    \\          375x667.
+    \\          Defaults to 1920x1080.
     \\  --watchdog-ms <INT>
     \\          Terminates JavaScript when the browser stalls — stays busy for
     \\          this long without returning to its network poll (e.g. a page

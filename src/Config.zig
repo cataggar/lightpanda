@@ -24,6 +24,7 @@ const cli = @import("cli.zig");
 const string = @import("string.zig");
 const dump = @import("browser/dump.zig");
 const Mime = @import("browser/Mime.zig");
+const Viewport = @import("browser/Viewport.zig");
 
 const WebBotAuthConfig = @import("network/WebBotAuth.zig").Config;
 const HttpHeader = @import("network/http.zig").Header;
@@ -118,11 +119,6 @@ fn httpHeaderValidator(allocator: Allocator, args: *std.process.Args.Iterator, l
 
     if (Mime.isHttpHeaderValue(header.value) == false) {
         log.fatal(.app, "invalid option value", .{ .arg = "--http-header", .value = str, .hint = "value must be Latin-1 text without CR, LF or NUL" });
-        return error.InvalidArgument;
-    }
-
-    if (std.ascii.eqlIgnoreCase(header.name, "User-Agent")) {
-        log.fatal(.app, "invalid option value", .{ .arg = "--http-header", .value = str, .hint = "Use --user-agent instead" });
         return error.InvalidArgument;
     }
 
@@ -243,11 +239,13 @@ pub const LoadResources = packed struct(u6) {
     none: bool = false,
 };
 
-pub const ExperimentalFeatures = packed struct(u4) {
+pub const ExperimentalFeatures = packed struct(u6) {
     cors: bool = false, // ignored, kept only for backward compatibility.
     serviceworker: bool = false,
     privatecache: bool = false,
     animation: bool = false,
+    ua_override: bool = false,
+    layout_intersection: bool = false,
 };
 
 const DisabledFeatures = packed struct(u1) {
@@ -265,6 +263,8 @@ const CommonOptions = .{
     .{ .name = "http_max_host_open", .type = ?u8 },
     .{ .name = "http_nav_delay", .type = ?u32 },
     .{ .name = "http_nav_burst", .type = ?u32 },
+    .{ .name = "http_latency", .type = ?u64 },
+    .{ .name = "http_max_recv_speed", .type = ?u64 },
     .{ .name = "http_timeout", .type = ?u31 },
     .{ .name = "http_version", .type = HttpVersion, .default = .auto },
     .{ .name = "http_connect_timeout", .type = ?u31 },
@@ -303,6 +303,15 @@ const CommonOptions = .{
     .{ .name = "v8_flags_unsafe", .type = ?[]const u8 },
     .{ .name = "v8_gc_hint_floor_mb", .type = ?u16 },
     .{ .name = "v8_max_heap_mb", .type = ?u32 },
+    .{
+        .name = "viewport",
+        .type = .{
+            .cli = []const u8,
+            .memory = ?Viewport,
+        },
+        .default = @as(?Viewport, null),
+        .validator = viewportValidator,
+    },
     .{ .name = "watchdog_ms", .type = ?u32 },
     .{
         .name = "ca_cert",
@@ -557,6 +566,32 @@ pub fn init(allocator: Allocator, exec_name: []const u8, mode: Mode) !Config {
         .exec_name = exec_name,
         .http_headers = undefined,
     };
+
+    const allow_ua_override = switch (config.mode) {
+        inline .serve, .fetch, .mcp, .agent, .run => |opts| opts.experimental_features.ua_override,
+        else => false,
+    };
+
+    if (config.userAgent()) |ua| {
+        validateUserAgentWithOpts(ua, allow_ua_override) catch |err| {
+            log.fatal(.app, "invalid user-agent", .{ .err = err, .hint = "must be printable ASCII and can't contain Mozilla" });
+            return error.InvalidArgument;
+        };
+    }
+
+    for (config.httpHeaders()) |hdr| {
+        if (std.ascii.eqlIgnoreCase(hdr.name, "User-Agent")) {
+            if (!allow_ua_override) {
+                log.fatal(.app, "invalid option value", .{ .arg = "--http-header", .value = hdr.value, .hint = "Use --user-agent instead" });
+                return error.InvalidArgument;
+            }
+            validateUserAgentWithOpts(hdr.value, true) catch |err| {
+                log.fatal(.app, "invalid option value", .{ .arg = "--http-header", .value = hdr.value, .err = err });
+                return error.InvalidArgument;
+            };
+        }
+    }
+
     if (modeNeedsHttp(mode)) {
         config.http_headers = try HttpHeaders.init(allocator, &config);
     }
@@ -574,7 +609,7 @@ pub fn init(allocator: Allocator, exec_name: []const u8, mode: Mode) !Config {
             // open. An explicit --load-resources replaces this default.
             if (@hasField(@TypeOf(m.*), "load_resources")) {
                 const given = m.load_resources != LoadResources{};
-                if (!given and (config.command == .mcp or config.command == .agent)) {
+                if (!given and (config.command == .mcp or config.command == .agent or config.command == .run)) {
                     m.load_resources.stylesheet = true;
                 }
             }
@@ -592,7 +627,7 @@ pub fn deinit(self: *const Config, allocator: Allocator) void {
 
 pub fn interactive(self: *const Config) bool {
     return switch (self.mode) {
-        .fetch => false,
+        .fetch, .run => false,
         .serve, .mcp => true,
         .agent => |opts| opts.script_file == null,
         else => unreachable,
@@ -601,7 +636,7 @@ pub fn interactive(self: *const Config) bool {
 
 pub fn tlsVerifyHost(self: *const Config) bool {
     return switch (self.mode) {
-        inline .serve, .fetch, .mcp, .agent => |opts| !opts.insecure_disable_tls_host_verification,
+        inline .serve, .fetch, .mcp, .agent, .run => |opts| !opts.insecure_disable_tls_host_verification,
         // `version --check` talks to the release endpoint; always verify.
         .version => true,
         else => unreachable,
@@ -610,49 +645,56 @@ pub fn tlsVerifyHost(self: *const Config) bool {
 
 pub fn obeyCors(self: *const Config) bool {
     return switch (self.mode) {
-        inline .serve, .fetch, .mcp, .agent => |opts| opts.disable_features.cors == false,
+        inline .serve, .fetch, .mcp, .agent, .run => |opts| opts.disable_features.cors == false,
         else => unreachable,
     };
 }
 
 pub fn obeyRobots(self: *const Config) bool {
     return switch (self.mode) {
-        inline .serve, .fetch, .mcp, .agent => |opts| opts.obey_robots,
+        inline .serve, .fetch, .mcp, .agent, .run => |opts| opts.obey_robots,
         else => unreachable,
     };
 }
 
 pub fn robotStoreEntryLimit(self: *const Config) u32 {
     return switch (self.mode) {
-        inline .serve, .fetch, .mcp, .agent => |opts| opts.robot_store_entry_limit.?,
+        inline .serve, .fetch, .mcp, .agent, .run => |opts| opts.robot_store_entry_limit.?,
         else => 1000,
     };
 }
 
 pub fn corsStoreEntryLimit(self: *const Config) u32 {
     return switch (self.mode) {
-        inline .serve, .fetch, .mcp, .agent => |opts| opts.cors_store_entry_limit.?,
+        inline .serve, .fetch, .mcp, .agent, .run => |opts| opts.cors_store_entry_limit.?,
         else => 1000,
     };
 }
 
 pub fn httpVersion(self: *const Config) HttpVersion {
     return switch (self.mode) {
-        inline .serve, .fetch, .mcp, .agent => |opts| opts.http_version,
+        inline .serve, .fetch, .mcp, .agent, .run => |opts| opts.http_version,
         else => unreachable,
     };
 }
 
 pub fn experimentalFeatures(self: *const Config) ExperimentalFeatures {
     return switch (self.mode) {
-        inline .serve, .fetch, .mcp, .agent => |opts| opts.experimental_features,
+        inline .serve, .fetch, .mcp, .agent, .run => |opts| opts.experimental_features,
         else => unreachable,
+    };
+}
+
+pub fn viewport(self: *const Config) ?Viewport {
+    return switch (self.mode) {
+        inline .serve, .fetch, .mcp, .agent, .run => |opts| opts.viewport,
+        else => null,
     };
 }
 
 pub fn watchdogMs(self: *const Config) ?u32 {
     return switch (self.mode) {
-        inline .serve, .fetch, .mcp, .agent => |opts| {
+        inline .serve, .fetch, .mcp, .agent, .run => |opts| {
             const ms = opts.watchdog_ms orelse 30000;
             return if (ms == 0) null else ms;
         },
@@ -662,21 +704,21 @@ pub fn watchdogMs(self: *const Config) ?u32 {
 
 pub fn loadResources(self: *const Config) LoadResources {
     return switch (self.mode) {
-        inline .serve, .fetch, .mcp, .agent => |opts| opts.load_resources,
+        inline .serve, .fetch, .mcp, .agent, .run => |opts| opts.load_resources,
         else => unreachable,
     };
 }
 
 pub fn v8Flags(self: *const Config) ?[]const u8 {
     return switch (self.mode) {
-        inline .serve, .fetch, .mcp, .agent => |opts| opts.v8_flags_unsafe,
+        inline .serve, .fetch, .mcp, .agent, .run => |opts| opts.v8_flags_unsafe,
         else => unreachable,
     };
 }
 
 pub fn v8MaxHeapMb(self: *const Config) ?u32 {
     return switch (self.mode) {
-        inline .serve, .fetch, .mcp, .agent => |opts| opts.v8_max_heap_mb,
+        inline .serve, .fetch, .mcp, .agent, .run => |opts| opts.v8_max_heap_mb,
         else => unreachable,
     };
 }
@@ -684,7 +726,7 @@ pub fn v8MaxHeapMb(self: *const Config) ?u32 {
 pub fn v8GCHintFloor(self: *const Config) ?u64 {
     const mb = switch (self.mode) {
         .fetch => |opts| opts.v8_gc_hint_floor_mb,
-        inline .serve, .mcp, .agent => |opts| opts.v8_gc_hint_floor_mb orelse 1,
+        inline .serve, .mcp, .agent, .run => |opts| opts.v8_gc_hint_floor_mb orelse 1,
         else => unreachable,
     } orelse return null;
 
@@ -693,7 +735,7 @@ pub fn v8GCHintFloor(self: *const Config) ?u64 {
 
 pub fn httpProxy(self: *const Config) ?[:0]const u8 {
     return switch (self.mode) {
-        inline .serve, .fetch, .mcp, .agent => |opts| opts.http_proxy,
+        inline .serve, .fetch, .mcp, .agent, .run => |opts| opts.http_proxy,
         .version => null,
         else => unreachable,
     };
@@ -701,14 +743,14 @@ pub fn httpProxy(self: *const Config) ?[:0]const u8 {
 
 pub fn httpHeaders(self: *const Config) []const HttpHeader {
     return switch (self.mode) {
-        inline .serve, .fetch, .mcp, .agent => |opts| opts.http_header.items,
+        inline .serve, .fetch, .mcp, .agent, .run => |opts| opts.http_header.items,
         else => &.{},
     };
 }
 
 fn proxyBearerToken(self: *const Config) ?[:0]const u8 {
     return switch (self.mode) {
-        inline .serve, .fetch, .mcp, .agent => |opts| opts.proxy_bearer_token,
+        inline .serve, .fetch, .mcp, .agent, .run => |opts| opts.proxy_bearer_token,
         else => null,
     };
 }
@@ -716,21 +758,21 @@ fn proxyBearerToken(self: *const Config) ?[:0]const u8 {
 pub fn httpMaxConcurrent(self: *const Config) u16 {
     return switch (self.mode) {
         .serve => |opts| opts.http_max_concurrent orelse std.math.clamp(opts.cdp_max_connections *| 8, 40, 256),
-        inline .fetch, .mcp, .agent => |opts| opts.http_max_concurrent orelse 40,
+        inline .fetch, .mcp, .agent, .run => |opts| opts.http_max_concurrent orelse 40,
         else => unreachable,
     };
 }
 
 pub fn httpMaxHostOpen(self: *const Config) u8 {
     return switch (self.mode) {
-        inline .serve, .fetch, .mcp, .agent => |opts| opts.http_max_host_open orelse 6,
+        inline .serve, .fetch, .mcp, .agent, .run => |opts| opts.http_max_host_open orelse 6,
         else => unreachable,
     };
 }
 
 pub fn httpNavDelay(self: *const Config) ?u32 {
     const ms = switch (self.mode) {
-        inline .serve, .fetch, .mcp, .agent => |opts| opts.http_nav_delay,
+        inline .serve, .fetch, .mcp, .agent, .run => |opts| opts.http_nav_delay,
         else => unreachable,
     } orelse return null;
     return if (ms == 0) null else ms;
@@ -738,15 +780,29 @@ pub fn httpNavDelay(self: *const Config) ?u32 {
 
 pub fn httpNavBurst(self: *const Config) u32 {
     const burst = switch (self.mode) {
-        inline .serve, .fetch, .mcp, .agent => |opts| opts.http_nav_burst,
+        inline .serve, .fetch, .mcp, .agent, .run => |opts| opts.http_nav_burst,
         else => unreachable,
-    } orelse 1;
-    return @max(burst, 1);
+    };
+    return @max(burst orelse 1, 1);
+}
+
+pub fn httpLatency(self: *const Config) u64 {
+    return switch (self.mode) {
+        inline .serve, .fetch, .mcp, .agent, .run => |opts| opts.http_latency orelse 0,
+        else => 0,
+    };
+}
+
+pub fn httpMaxRecvSpeed(self: *const Config) u64 {
+    return switch (self.mode) {
+        inline .serve, .fetch, .mcp, .agent, .run => |opts| opts.http_max_recv_speed orelse 0,
+        else => 0,
+    };
 }
 
 pub fn httpConnectTimeout(self: *const Config) u31 {
     return switch (self.mode) {
-        inline .serve, .fetch, .mcp, .agent => |opts| opts.http_connect_timeout orelse 8000,
+        inline .serve, .fetch, .mcp, .agent, .run => |opts| opts.http_connect_timeout orelse 8000,
         .version => 0,
         else => unreachable,
     };
@@ -754,7 +810,7 @@ pub fn httpConnectTimeout(self: *const Config) u31 {
 
 pub fn httpTimeout(self: *const Config) u31 {
     return switch (self.mode) {
-        inline .serve, .fetch, .mcp, .agent => |opts| opts.http_timeout orelse 15000,
+        inline .serve, .fetch, .mcp, .agent, .run => |opts| opts.http_timeout orelse 15000,
         .version => 5000,
         else => unreachable,
     };
@@ -768,14 +824,14 @@ pub fn httpMaxRedirects(_: *const Config) u8 {
 
 pub fn httpMaxResponseSize(self: *const Config) ?usize {
     return switch (self.mode) {
-        inline .serve, .fetch, .mcp, .agent => |opts| opts.http_max_response_size,
+        inline .serve, .fetch, .mcp, .agent, .run => |opts| opts.http_max_response_size,
         else => unreachable,
     };
 }
 
 pub fn wsMaxConcurrent(self: *const Config) u8 {
     return switch (self.mode) {
-        inline .serve, .fetch, .mcp, .agent => |opts| opts.ws_max_concurrent orelse 8,
+        inline .serve, .fetch, .mcp, .agent, .run => |opts| opts.ws_max_concurrent orelse 8,
         else => unreachable,
     };
 }
@@ -805,77 +861,77 @@ pub fn stderrIsTty() bool {
 
 fn userAgentSuffix(self: *const Config) ?[]const u8 {
     return switch (self.mode) {
-        inline .serve, .fetch, .mcp, .agent => |opts| opts.user_agent_suffix,
+        inline .serve, .fetch, .mcp, .agent, .run => |opts| opts.user_agent_suffix,
         else => null,
     };
 }
 
 pub fn userAgent(self: *const Config) ?[]const u8 {
     return switch (self.mode) {
-        inline .serve, .fetch, .mcp, .agent => |opts| opts.user_agent,
+        inline .serve, .fetch, .mcp, .agent, .run => |opts| opts.user_agent,
         else => null,
     };
 }
 
 pub fn locale(self: *const Config) [:0]const u8 {
     return switch (self.mode) {
-        inline .serve, .fetch, .mcp, .agent => |opts| opts.locale,
+        inline .serve, .fetch, .mcp, .agent, .run => |opts| opts.locale,
         else => HttpHeaders.default_locale,
     };
 }
 
 pub fn timezone(self: *const Config) ?[:0]const u8 {
     return switch (self.mode) {
-        inline .serve, .fetch, .mcp, .agent => |opts| opts.timezone,
+        inline .serve, .fetch, .mcp, .agent, .run => |opts| opts.timezone,
         else => null,
     };
 }
 
 pub fn httpCacheDir(self: *const Config) ?[]const u8 {
     return switch (self.mode) {
-        inline .serve, .fetch, .mcp, .agent => |opts| opts.http_cache_dir,
+        inline .serve, .fetch, .mcp, .agent, .run => |opts| opts.http_cache_dir,
         else => null,
     };
 }
 
 pub fn httpDebug(self: *const Config) bool {
     return switch (self.mode) {
-        inline .serve, .fetch, .mcp, .agent => |opts| opts.http_debug,
+        inline .serve, .fetch, .mcp, .agent, .run => |opts| opts.http_debug,
         else => false,
     };
 }
 
 pub fn httpCurves(self: *const Config) ?[:0]const u8 {
     return switch (self.mode) {
-        inline .serve, .fetch, .mcp, .agent => |opts| opts.http_curves,
+        inline .serve, .fetch, .mcp, .agent, .run => |opts| opts.http_curves,
         else => null,
     };
 }
 
 pub fn renderFonts(self: *const Config) []const []const u8 {
     return switch (self.mode) {
-        inline .serve, .fetch, .mcp, .agent => |opts| opts.render_font.items,
+        inline .serve, .fetch, .mcp, .agent, .run => |opts| opts.render_font.items,
         else => &.{},
     };
 }
 
 pub fn httpCacheEntryLimit(self: *const Config) u32 {
     return switch (self.mode) {
-        inline .serve, .fetch, .mcp, .agent => |opts| opts.http_cache_entry_limit.?,
+        inline .serve, .fetch, .mcp, .agent, .run => |opts| opts.http_cache_entry_limit.?,
         else => 1000,
     };
 }
 
 pub fn cookieFile(self: *const Config) ?[]const u8 {
     return switch (self.mode) {
-        inline .serve, .fetch, .mcp, .agent => |opts| opts.cookie,
+        inline .serve, .fetch, .mcp, .agent, .run => |opts| opts.cookie,
         else => null,
     };
 }
 
 pub fn cookieJarFile(self: *const Config) ?[]const u8 {
     return switch (self.mode) {
-        inline .serve, .fetch, .mcp, .agent => |opts| opts.cookie_jar,
+        inline .serve, .fetch, .mcp, .agent, .run => |opts| opts.cookie_jar,
         else => null,
     };
 }
@@ -944,7 +1000,7 @@ fn isHostWildcard(host: []const u8) bool {
 
 pub fn webBotAuth(self: *const Config) ?WebBotAuthConfig {
     return switch (self.mode) {
-        inline .serve, .fetch, .mcp, .agent => |opts| WebBotAuthConfig{
+        inline .serve, .fetch, .mcp, .agent, .run => |opts| WebBotAuthConfig{
             .key_file = opts.web_bot_auth_key_file orelse return null,
             .keyid = opts.web_bot_auth_keyid orelse return null,
             .domain = opts.web_bot_auth_domain orelse return null,
@@ -955,21 +1011,21 @@ pub fn webBotAuth(self: *const Config) ?WebBotAuthConfig {
 
 pub fn blockPrivateNetworks(self: *const Config) bool {
     return switch (self.mode) {
-        inline .serve, .fetch, .mcp, .agent => |opts| opts.block_private_networks,
+        inline .serve, .fetch, .mcp, .agent, .run => |opts| opts.block_private_networks,
         else => unreachable,
     };
 }
 
 pub fn blockCidrs(self: *const Config) ?[]const u8 {
     return switch (self.mode) {
-        inline .serve, .fetch, .mcp, .agent => |opts| opts.block_cidrs,
+        inline .serve, .fetch, .mcp, .agent, .run => |opts| opts.block_cidrs,
         else => unreachable,
     };
 }
 
 pub fn blockedUrlPatterns(self: *const Config) ?std.mem.SplitIterator(u8, .scalar) {
     const patterns = switch (self.mode) {
-        inline .serve, .fetch, .mcp, .agent => |opts| opts.block_urls,
+        inline .serve, .fetch, .mcp, .agent, .run => |opts| opts.block_urls,
         else => unreachable,
     } orelse return null;
     return std.mem.splitScalar(u8, patterns, ',');
@@ -977,7 +1033,7 @@ pub fn blockedUrlPatterns(self: *const Config) ?std.mem.SplitIterator(u8, .scala
 
 pub fn adblockLists(self: *const Config) ?std.mem.SplitIterator(u8, .scalar) {
     const paths = switch (self.mode) {
-        inline .serve, .fetch, .mcp, .agent => |opts| opts.adblock_lists,
+        inline .serve, .fetch, .mcp, .agent, .run => |opts| opts.adblock_lists,
         else => unreachable,
     } orelse return null;
     return std.mem.splitScalar(u8, paths, ',');
@@ -1000,7 +1056,7 @@ pub fn maxConnections(self: *const Config) u16 {
     return switch (self.mode) {
         .serve => |opts| opts.cdp_max_connections,
         .mcp => 16,
-        .fetch, .agent => 0,
+        .fetch, .agent, .run => 0,
         else => unreachable,
     };
 }
@@ -1053,7 +1109,7 @@ pub fn cdpMaxHTTPMessageSize(self: *const Config) u32 {
 /// if any was loaded during argument parsing. The caller takes ownership.
 pub fn customCertStore(self: *const Config) ?*crypto.X509_STORE {
     return switch (self.mode) {
-        inline .serve, .fetch, .mcp, .agent => |opts| {
+        inline .serve, .fetch, .mcp, .agent, .run => |opts| {
             const store = opts.cert.store orelse return null;
             // Validators guarantee a created store loaded something.
             lp.assert(opts.cert.count > 0, "empty custom cert store", .{});
@@ -1321,9 +1377,64 @@ fn printPaged(allocator: Allocator, text: []const u8) void {
     }
 }
 
+fn freeFailedModeAllocations(allocator: Allocator, m: anytype) void {
+    if (@hasField(@TypeOf(m.*), "user_agent")) {
+        if (m.user_agent) |ua| allocator.free(ua);
+    }
+    if (@hasField(@TypeOf(m.*), "http_header")) {
+        for (m.http_header.items) |hdr| {
+            allocator.free(hdr.name);
+            allocator.free(hdr.value);
+        }
+        m.http_header.deinit(allocator);
+    }
+    if (@hasField(@TypeOf(m.*), "url")) {
+        if (@typeInfo(@TypeOf(m.url)) == .@"struct") {
+            for (m.url.items) |u| allocator.free(u);
+            m.url.deinit(allocator);
+        } else if (m.url) |u| {
+            allocator.free(u);
+        }
+    }
+}
+
 pub fn parseArgs(allocator: Allocator, proc_args: std.process.Args) !Config {
     const exec_name, var command = try Commands.parse(allocator, proc_args);
     const invoked = std.meta.activeTag(command);
+
+    switch (command) {
+        inline else => |*m| {
+            if (@hasField(@TypeOf(m.*), "experimental_features")) {
+                const allow_ua_override = m.experimental_features.ua_override;
+                if (@hasField(@TypeOf(m.*), "user_agent")) {
+                    if (m.user_agent) |ua| {
+                        validateUserAgentWithOpts(ua, allow_ua_override) catch |err| {
+                            log.fatal(.app, "invalid user-agent", .{ .err = err, .hint = "must be printable ASCII and can't contain Mozilla" });
+                            freeFailedModeAllocations(allocator, m);
+                            return error.InvalidArgument;
+                        };
+                    }
+                }
+                if (@hasField(@TypeOf(m.*), "http_header")) {
+                    for (m.http_header.items) |hdr| {
+                        if (std.ascii.eqlIgnoreCase(hdr.name, "User-Agent")) {
+                            if (!allow_ua_override) {
+                                log.fatal(.app, "invalid option value", .{ .arg = "--http-header", .value = hdr.value, .hint = "Use --user-agent instead" });
+                                freeFailedModeAllocations(allocator, m);
+                                return error.InvalidArgument;
+                            }
+                            validateUserAgentWithOpts(hdr.value, true) catch |err| {
+                                log.fatal(.app, "invalid option value", .{ .arg = "--http-header", .value = hdr.value, .err = err });
+                                freeFailedModeAllocations(allocator, m);
+                                return error.InvalidArgument;
+                            };
+                        }
+                    }
+                }
+            }
+        },
+    }
+
     // Rewrite `run` to `.agent` so nothing downstream needs a `.run` case.
     if (command == .run) {
         const run = command.run;
@@ -1782,24 +1893,57 @@ fn accumulateValidator(allocator: Allocator, args: *std.process.Args.Iterator, f
 
 fn userAgentValidator(allocator: Allocator, args: *std.process.Args.Iterator, ua: *?[]const u8) !void {
     const str = args.next() orelse return error.MissingArgument;
-    validateUserAgent(str) catch |err| {
-        log.fatal(.app, "invalid user-agent", .{ .err = err, .hint = "must be printable ASCII and can't contain Mozilla" });
-        return error.InvalidArgument;
-    };
+    for (str) |c| {
+        if (!std.ascii.isPrint(c)) {
+            log.fatal(.app, "invalid user-agent", .{ .err = error.NonPrintable, .hint = "must be printable ASCII and can't contain Mozilla" });
+            return error.InvalidArgument;
+        }
+    }
 
+    if (ua.*) |prev| allocator.free(prev);
     ua.* = try allocator.dupe(u8, str);
 }
 
 pub fn validateUserAgent(ua: []const u8) !void {
+    return validateUserAgentWithOpts(ua, false);
+}
+
+pub fn validateUserAgentWithOpts(ua: []const u8, allow_mozilla: bool) !void {
     for (ua) |c| {
         if (!std.ascii.isPrint(c)) {
             return error.NonPrintable;
         }
     }
 
-    if (std.ascii.findIgnoreCase(ua, "mozilla") != null) {
+    if (!allow_mozilla and std.ascii.findIgnoreCase(ua, "mozilla") != null) {
         return error.Reserved;
     }
+}
+
+fn viewportValidator(_: Allocator, args: *std.process.Args.Iterator, target: *?Viewport) !void {
+    const str = args.next() orelse return error.MissingArgument;
+    target.* = parseViewport(str) catch |err| {
+        log.fatal(.app, "invalid option value", .{ .arg = "--viewport", .value = str, .err = err, .hint = "must be WIDTHxHEIGHT in positive CSS pixels (e.g. 1920x1080, 375x667)" });
+        return error.InvalidArgument;
+    };
+}
+
+pub fn parseViewport(str: []const u8) !Viewport {
+    const sep = std.mem.findAny(u8, str, "xX") orelse return error.InvalidFormat;
+    const w_str = str[0..sep];
+    const h_str = str[sep + 1 ..];
+    if (w_str.len == 0 or h_str.len == 0 or std.mem.findAny(u8, h_str, "xX") != null) {
+        return error.InvalidFormat;
+    }
+    const width = std.fmt.parseInt(u32, w_str, 10) catch return error.InvalidFormat;
+    const height = std.fmt.parseInt(u32, h_str, 10) catch return error.InvalidFormat;
+    if (width == 0 or height == 0 or width > 10_000_000 or height > 10_000_000) {
+        return error.OutOfRange;
+    }
+    return .{
+        .width = width,
+        .height = height,
+    };
 }
 
 fn localeValidator(allocator: Allocator, args: *std.process.Args.Iterator, field: *[:0]const u8) !void {
@@ -1951,4 +2095,137 @@ test "Config: --unix-socket" {
     defer arena.deinit();
     const config = try parseArgs(arena.allocator(), .{ .vector = &vector });
     try std.testing.expectEqualStrings("/tmp/lp.sock", config.mode.serve.unix_socket.?);
+}
+
+test "Config: run mode accessors and CLI flags" {
+    const saved_log_opts = log.opts;
+    defer log.opts = saved_log_opts;
+
+    {
+        var config = try Config.init(std.testing.allocator, "lightpanda", .{ .run = .{
+            .script_file = "script.js",
+            .cookie = "cookies.json",
+            .cookie_jar = "jar.json",
+            .viewport = .{ .width = 375, .height = 667 },
+            .http_latency = 120,
+            .http_max_recv_speed = 65536,
+        } });
+        defer config.deinit(std.testing.allocator);
+
+        try std.testing.expect(!config.interactive());
+        try std.testing.expect(config.loadResources().stylesheet);
+        try std.testing.expectEqualStrings("cookies.json", config.cookieFile().?);
+        try std.testing.expectEqualStrings("jar.json", config.cookieJarFile().?);
+        try std.testing.expectEqual(@as(u32, 375), config.viewport().?.width);
+        try std.testing.expectEqual(@as(u32, 667), config.viewport().?.height);
+        try std.testing.expectEqual(@as(u64, 120), config.httpLatency());
+        try std.testing.expectEqual(@as(u64, 65536), config.httpMaxRecvSpeed());
+    }
+
+    {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const argv = [_][*:0]const u8{
+            "lightpanda",
+            "run",
+            "script.js",
+            "--cookie",
+            "in.json",
+            "--cookie-jar",
+            "out.json",
+            "--viewport",
+            "1280x720",
+            "--http-latency",
+            "50",
+            "--http-max-recv-speed",
+            "102400",
+        };
+        const config = try parseArgs(arena.allocator(), .{ .vector = &argv });
+        try std.testing.expectEqualStrings("in.json", config.cookieFile().?);
+        try std.testing.expectEqualStrings("out.json", config.cookieJarFile().?);
+        try std.testing.expectEqual(@as(u32, 1280), config.viewport().?.width);
+        try std.testing.expectEqual(@as(u32, 720), config.viewport().?.height);
+        try std.testing.expectEqual(@as(u64, 50), config.httpLatency());
+        try std.testing.expectEqual(@as(u64, 102400), config.httpMaxRecvSpeed());
+    }
+}
+
+test "Config: --viewport validation" {
+    try std.testing.expectEqual(Viewport{ .width = 1920, .height = 1080 }, try parseViewport("1920x1080"));
+    try std.testing.expectEqual(Viewport{ .width = 375, .height = 667 }, try parseViewport("375X667"));
+    try std.testing.expectError(error.InvalidFormat, parseViewport("1920"));
+    try std.testing.expectError(error.InvalidFormat, parseViewport("1920x"));
+    try std.testing.expectError(error.InvalidFormat, parseViewport("x1080"));
+    try std.testing.expectError(error.InvalidFormat, parseViewport("1920x1080x2"));
+    try std.testing.expectError(error.InvalidFormat, parseViewport("-100x200"));
+    try std.testing.expectError(error.OutOfRange, parseViewport("0x1080"));
+    try std.testing.expectError(error.OutOfRange, parseViewport("1920x0"));
+    try std.testing.expectError(error.OutOfRange, parseViewport("20000000x1080"));
+}
+
+test "Config: --experimental-features ua_override allows Mozilla User-Agent" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    // Without ua_override, Mozilla is rejected.
+    {
+        log.expectLog(&.{.app});
+        const argv = [_][*:0]const u8{ "lightpanda", "fetch", "--user-agent", "Mozilla/5.0 TestBrowser/1.0", "http://example.com" };
+        try std.testing.expectError(error.InvalidArgument, parseArgs(arena.allocator(), .{ .vector = &argv }));
+    }
+
+    // With ua_override (in either flag order), Mozilla is accepted.
+    {
+        const argv = [_][*:0]const u8{
+            "lightpanda",
+            "fetch",
+            "--user-agent",
+            "Mozilla/5.0 TestBrowser/1.0",
+            "--experimental-features",
+            "ua_override",
+            "http://example.com",
+        };
+        const config = try parseArgs(arena.allocator(), .{ .vector = &argv });
+        try std.testing.expectEqualStrings("Mozilla/5.0 TestBrowser/1.0", config.http_headers.user_agent);
+    }
+
+    // Empty --user-agent remains accepted for backwards compatibility.
+    {
+        const argv = [_][*:0]const u8{ "lightpanda", "fetch", "--user-agent", "", "http://example.com" };
+        const config = try parseArgs(arena.allocator(), .{ .vector = &argv });
+        try std.testing.expectEqualStrings("", config.http_headers.user_agent);
+    }
+
+    // --http-header "User-Agent: Mozilla/..." works when ua_override is enabled, in either order.
+    {
+        const argv = [_][*:0]const u8{
+            "lightpanda",
+            "fetch",
+            "--http-header",
+            "User-Agent: Mozilla/5.0 ExtraHeader/1.0",
+            "--experimental-features",
+            "ua_override,layout_intersection",
+            "http://example.com",
+        };
+        const config = try parseArgs(arena.allocator(), .{ .vector = &argv });
+        try std.testing.expect(config.experimentalFeatures().ua_override);
+        try std.testing.expect(config.experimentalFeatures().layout_intersection);
+        try std.testing.expectEqual(@as(usize, 1), config.httpHeaders().len);
+        try std.testing.expectEqualStrings("Mozilla/5.0 ExtraHeader/1.0", config.httpHeaders()[0].value);
+    }
+
+    // CR/LF header injection is still rejected even with ua_override.
+    {
+        log.expectLog(&.{.app});
+        const argv = [_][*:0]const u8{
+            "lightpanda",
+            "fetch",
+            "--experimental-features",
+            "ua_override",
+            "--user-agent",
+            "Mozilla/5.0\r\nX-Injected: 1",
+            "http://example.com",
+        };
+        try std.testing.expectError(error.InvalidArgument, parseArgs(arena.allocator(), .{ .vector = &argv }));
+    }
 }

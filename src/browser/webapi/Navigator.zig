@@ -93,8 +93,8 @@ pub fn getLanguage(self: *const Navigator, exec: *const Execution) []const u8 {
     return if (languages.len == 0) "" else languages[0];
 }
 
-pub fn getOnLine(_: *const Navigator) bool {
-    return true;
+pub fn getOnLine(_: *const Navigator, exec: *const Execution) bool {
+    return !exec.session.browser.http_client.network_conditions.offline;
 }
 
 fn getCookieEnabled(_: *const Navigator) bool {

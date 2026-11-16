@@ -1679,7 +1679,7 @@ pub fn getElementAxis(self: *Element, frame: *Frame, comptime axis: Axis) Axis.S
     // Root containers span the document, see Document.extent.
     if (root) {
         return .{ .value = switch (axis) {
-            .width => 1920.0,
+            .width => @floatFromInt((self.ownerFrame(frame) orelse frame).page.getViewport().width),
             .height => if (self.asNode().ownerDocument(frame)) |doc| doc.extent().height else 0.0,
         } };
     }
@@ -1770,6 +1770,12 @@ pub fn boxAxis(self: *Element, frame: *Frame, comptime axis: Axis) f64 {
         return layout.boxWidth(self, owner);
     }
 
+    if (self.ownerFrame(frame)) |owner| {
+        if (owner.layoutIntersectionEnabled()) {
+            return layout.boxHeight(self, owner);
+        }
+    }
+
     const own = self.getElementAxis(frame, axis);
     if (own.explicit) {
         // an explicitly set value always wins
@@ -1799,6 +1805,11 @@ pub fn boundingClientRectValues(self: *Element, frame: *Frame) DOMRect.Data {
 
 // Some cases need the bounding rect but have already done the visibility check.
 pub fn boundingClientRectValuesForVisible(self: *Element, frame: *Frame) DOMRect.Data {
+    if (self.ownerFrame(frame)) |owner| {
+        if (owner.layoutIntersectionEnabled()) {
+            return layout.elementClientRect(self, owner);
+        }
+    }
     const origin = self.clientOrigin(frame);
     return .{
         .x = origin.x,
@@ -1900,6 +1911,12 @@ pub fn getScrollHeight(self: *Element, frame: *Frame) f64 {
     // The root scroller reports what the viewport scrolls over.
     if (self.isRootContainer()) {
         return self.rootScrollSize(frame, .height) orelse height;
+    }
+
+    if (self.ownerFrame(frame)) |owner| {
+        if (owner.layoutIntersectionEnabled()) {
+            return layout.scrollHeight(self, owner);
+        }
     }
 
     return @max(height, self.contentAxis(frame, .height));
@@ -2015,12 +2032,42 @@ pub fn getOffsetTop(self: *Element, frame: *Frame) f64 {
     if (!self.isVisible(frame)) {
         return 0.0;
     }
+    if (self.ownerFrame(frame)) |owner| {
+        if (owner.layoutIntersectionEnabled()) {
+            const pos = layout.elementUntransformedPos(self, owner);
+            if (self.computedPosition(owner) == .fixed) {
+                return pos.y;
+            }
+            if (self.getOffsetParent(owner)) |op| {
+                if (!op.isRootContainer()) {
+                    const op_pos = layout.elementUntransformedPos(op, owner);
+                    return pos.y - (op_pos.y - @as(f64, @floatFromInt(op.getScrollTop(owner))));
+                }
+            }
+            return pos.y + @as(f64, @floatFromInt(owner.window.getScrollY()));
+        }
+    }
     return calculateDocumentPosition(self.asNode(), frame);
 }
 
 pub fn getOffsetLeft(self: *Element, frame: *Frame) f64 {
     if (!self.isVisible(frame)) {
         return 0.0;
+    }
+    if (self.ownerFrame(frame)) |owner| {
+        if (owner.layoutIntersectionEnabled()) {
+            const pos = layout.elementUntransformedPos(self, owner);
+            if (self.computedPosition(owner) == .fixed) {
+                return pos.x;
+            }
+            if (self.getOffsetParent(owner)) |op| {
+                if (!op.isRootContainer()) {
+                    const op_pos = layout.elementUntransformedPos(op, owner);
+                    return pos.x - (op_pos.x - @as(f64, @floatFromInt(op.getScrollLeft(owner))));
+                }
+            }
+            return pos.x + @as(f64, @floatFromInt(owner.window.getScrollX()));
+        }
     }
     return self.horizontalPosition(frame);
 }
@@ -2239,9 +2286,13 @@ pub fn clone(self: *Element, deep: bool, document: *const Node.Document, frame: 
 
 pub fn scrollIntoViewIfNeeded(self: *Element, center_if_needed: ?bool, frame: *Frame) void {
     _ = center_if_needed;
-    const y = calculateDocumentPosition(self.asNode(), frame);
-    const scroll_y: f64 = @floatFromInt(frame.window.getScrollY());
-    const viewport_height: f64 = @floatFromInt(frame.window.getInnerHeight(frame));
+    const owner = self.ownerFrame(frame) orelse frame;
+    const scroll_y: f64 = @floatFromInt(owner.window.getScrollY());
+    const y = if (owner.layoutIntersectionEnabled())
+        layout.elementClientRect(self, owner).y + scroll_y
+    else
+        calculateDocumentPosition(self.asNode(), frame);
+    const viewport_height: f64 = @floatFromInt(owner.window.getInnerHeight(owner));
     if (y >= scroll_y and y < scroll_y + viewport_height) {
         return;
     }
@@ -2257,8 +2308,12 @@ pub fn scrollIntoView(self: *Element, opts: ?ScrollIntoViewOpts, frame: *Frame) 
     // Scroll the window so the element's top is brought into the viewport.
     // Positions come from the faux-layout document position (top = preorder
     // depth-scaled y), the same source getBoundingClientRect uses.
-    const y = calculateDocumentPosition(self.asNode(), frame);
-    frame.window.scrollTo(.{ .x = 0 }, @trunc(@max(0, y)), frame) catch {};
+    const owner = self.ownerFrame(frame) orelse frame;
+    const y = if (owner.layoutIntersectionEnabled())
+        layout.elementClientRect(self, owner).y + @as(f64, @floatFromInt(owner.window.getScrollY()))
+    else
+        calculateDocumentPosition(self.asNode(), frame);
+    owner.window.scrollTo(.{ .x = 0 }, @trunc(@max(0, y)), owner) catch {};
 }
 
 // The scrollTo/scrollBy argument shape shared with Window: positional (x, y)
@@ -2348,7 +2403,19 @@ fn writeScroll(self: *Element, write: ScrollWrite, frame: *Frame) !bool {
     }
     gop.value_ptr.x = x;
     gop.value_ptr.y = y;
+    const layout_io = owner.layoutIntersectionEnabled();
+    if (layout_io) {
+        owner._box_layout_version +%= 1;
+    }
+    const has_io = layout_io and Frame.observers.hasIntersectionObservers(owner);
+    if (has_io) {
+        owner._intersection.recheck_all = true;
+        Frame.observers.scheduleIntersectionChecks(owner);
+    }
     try self.scheduleScrollEvents(gop.value_ptr, owner);
+    if (has_io) {
+        owner.js.env.runMicrotasks();
+    }
     return true;
 }
 

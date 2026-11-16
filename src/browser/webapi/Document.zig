@@ -28,6 +28,7 @@ const IdMap = @import("../IdMap.zig");
 const js = @import("../js/js.zig");
 const Page = @import("../Page.zig");
 const Frame = @import("../Frame.zig");
+const layout = @import("../layout.zig");
 const Parser = @import("../parser/Parser.zig");
 
 const Node = @import("Node.zig");
@@ -95,9 +96,10 @@ _exec_command_settings: exec_command.Settings = .{},
 _design_mode: bool = false,
 _adopted_style_sheets: ?js.Object.Global = null,
 _selection: Selection = .{ ._rc = .init(1) },
-// extent() cache, keyed on layout version and viewport.
+// extent() cache, keyed on layout version, box version and viewport.
 _extent: ?struct {
     version: usize,
+    box_version: usize,
     viewport_width: u32,
     viewport_height: u32,
     extent: Extent,
@@ -498,6 +500,18 @@ pub fn getDocumentElement(self: *Document) ?*Element {
 
 pub const Extent = struct { width: f64, height: f64 };
 
+pub fn cacheExtent(self: *Document, size: Extent) void {
+    const frame = self._frame orelse return;
+    const viewport = frame.page.getViewport();
+    self._extent = .{
+        .version = frame._style_manager.layoutVersion(),
+        .box_version = frame._box_layout_version,
+        .viewport_width = viewport.width,
+        .viewport_height = viewport.height,
+        .extent = size,
+    };
+}
+
 /// The document's size. Height: enough for every synthetic position (5px per
 /// node), the bottom of every element with an inline height, and body's
 /// stacked children. Width: body's widest child. An inline size on body
@@ -506,11 +520,20 @@ pub const Extent = struct { width: f64, height: f64 };
 pub fn extent(self: *Document) Extent {
     const frame = self._frame orelse return .{ .width = 0, .height = 0 };
     const version = frame._style_manager.layoutVersion();
+    const box_version = frame._box_layout_version;
     const viewport = frame.page.getViewport();
     if (self._extent) |cached| {
-        if (cached.version == version and cached.viewport_width == viewport.width and cached.viewport_height == viewport.height) {
+        if (cached.version == version and
+            cached.box_version == box_version and
+            cached.viewport_width == viewport.width and
+            cached.viewport_height == viewport.height)
+        {
             return cached.extent;
         }
+    }
+
+    if (frame.layoutIntersectionEnabled()) {
+        return layout.documentFlowExtent(frame);
     }
 
     const style_manager = &frame._style_manager;
@@ -554,6 +577,7 @@ pub fn extent(self: *Document) Extent {
     size = .{ .width = @ceil(size.width), .height = @ceil(size.height) };
     self._extent = .{
         .version = version,
+        .box_version = box_version,
         .viewport_width = viewport.width,
         .viewport_height = viewport.height,
         .extent = size,

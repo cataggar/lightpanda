@@ -28,10 +28,12 @@ const js = @import("../js/js.zig");
 
 const Frame = @import("../Frame.zig");
 const Page = @import("../Page.zig");
+const layout = @import("../layout.zig");
 
 const Node = @import("../webapi/Node.zig");
 const Event = @import("../webapi/Event.zig");
 const Element = @import("../webapi/Element.zig");
+const Document = @import("../webapi/Document.zig");
 const ResizeObserver = @import("../webapi/ResizeObserver.zig");
 const MutationObserver = @import("../webapi/MutationObserver.zig");
 const IntersectionObserver = @import("../webapi/IntersectionObserver.zig");
@@ -58,6 +60,18 @@ pub const Intersection = struct {
     observers: std.ArrayList(*IntersectionObserver) = .empty,
     check_scheduled: bool = false,
     delivery_scheduled: bool = false,
+    recheck_all: bool = false,
+
+    // Persistent O(N) layout box cache populated lazily when
+    // `layout_intersection` is enabled; remains empty in default mode.
+    box_cache: layout.BoxMap = .empty,
+    cached_extent: Document.Extent = .{ .width = 0, .height = 0 },
+    box_cache_valid: bool = false,
+    box_cache_building: bool = false,
+    box_cache_style_version: usize = 0,
+    box_cache_box_version: usize = 0,
+    box_cache_vp_width: u32 = 0,
+    box_cache_vp_height: u32 = 0,
 
     // Deliveries closer together than INTERSECTION_QUIET_MS form one burst.
     // Frame.init re-initializes the whole struct, so a navigation starts fresh.
@@ -76,9 +90,36 @@ pub const Resize = struct {
     delivery_depth: u32 = 0,
 };
 
+fn pruneDocumentTargets(live_frame: *Frame, dying_frame: *const Frame, doc: *const Document) void {
+    if (live_frame == dying_frame or live_frame.document._navigated_away) {
+        return;
+    }
+    var i: usize = 0;
+    while (i < live_frame._intersection.observers.items.len) {
+        const obs = live_frame._intersection.observers.items[i];
+        obs.pruneDocument(doc, live_frame);
+        if (live_frame._intersection.observers.items.len > i and live_frame._intersection.observers.items[i] == obs) {
+            i += 1;
+        }
+    }
+    for (live_frame.child_frames.items) |child| {
+        pruneDocumentTargets(child, dying_frame, doc);
+    }
+}
+
+pub fn frameNeutered(frame: *Frame) void {
+    if (frame._type != .root) {
+        pruneDocumentTargets(&frame.page.frame, frame, frame.document);
+    }
+}
+
 // Releases the frame's references to its registered observers. Called from
 // Frame.deinit.
 pub fn deinit(frame: *Frame, page: *Page) void {
+    if (frame._type != .root) {
+        pruneDocumentTargets(&page.frame, frame, frame.document);
+    }
+
     var node: ?*std.DoublyLinkedList.Node = frame._mutation.observers.first;
     while (node) |n| {
         node = n.next; // capture before we potentially delete observer
@@ -89,6 +130,7 @@ pub fn deinit(frame: *Frame, page: *Page) void {
     for (frame._intersection.observers.items) |observer| {
         observer.releaseRef(page);
     }
+    frame._intersection.box_cache.deinit(page.session.browser.allocator);
 
     for (frame._resize.observers.items) |observer| {
         observer.releaseRef(page);
@@ -144,8 +186,36 @@ pub fn hasIntersectionObservers(frame: *const Frame) bool {
 }
 
 fn checkIntersections(frame: *Frame) !void {
+    const force = frame._intersection.recheck_all;
+    frame._intersection.recheck_all = false;
+    if (frame._intersection.observers.items.len == 0) {
+        return;
+    }
+
+    if (frame.layoutIntersectionEnabled()) {
+        var any_needed = force;
+        if (!any_needed) {
+            for (frame._intersection.observers.items) |observer| {
+                if (observer.needsCheck(frame)) {
+                    any_needed = true;
+                    break;
+                }
+            }
+        }
+        if (!any_needed) {
+            return;
+        }
+
+        _ = try layout.ensureBoxCache(frame);
+
+        for (frame._intersection.observers.items) |observer| {
+            try observer.checkIntersections(frame, force);
+        }
+        return;
+    }
+
     for (frame._intersection.observers.items) |observer| {
-        try observer.checkIntersections(frame);
+        try observer.checkIntersections(frame, force);
     }
 }
 
@@ -166,6 +236,9 @@ pub fn scheduleIntersectionDelivery(frame: *Frame) !void {
 }
 
 pub fn scheduleIntersectionChecks(frame: *Frame) void {
+    if (frame._intersection.observers.items.len == 0) {
+        return;
+    }
     if (frame._intersection.check_scheduled) {
         return;
     }
@@ -521,6 +594,21 @@ pub fn notifyAttributeChange(frame: *Frame, element: *Element, name: String, old
         };
     }
     resizeAttributeChanged(frame, element, name);
+    intersectionAttributeChanged(frame, name);
+}
+
+fn intersectionAttributeChanged(frame: *Frame, name: String) void {
+    if (frame._intersection.observers.items.len == 0) {
+        return;
+    }
+    switch (name.len) {
+        4 => if (!name.eqlWithSameLen(comptime .wrap("open"))) return,
+        5 => if (!name.eqlWithSameLen(comptime .wrap("style")) and !name.eqlWithSameLen(comptime .wrap("class")) and !name.eqlWithSameLen(comptime .wrap("width"))) return,
+        6 => if (!name.eqlWithSameLen(comptime .wrap("hidden")) and !name.eqlWithSameLen(comptime .wrap("height"))) return,
+        else => return,
+    }
+    frame._intersection.recheck_all = true;
+    scheduleIntersectionChecks(frame);
 }
 
 pub fn notifyCharacterDataChange(frame: *Frame, target: *Node, old_value: String) void {

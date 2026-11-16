@@ -1586,8 +1586,10 @@ fn runEval(arena: std.mem.Allocator, page: *lp.Frame, script: [:0]const u8, fall
 
     const js_result = ls.local.compileAndRun(script, null) catch |err| {
         if (err == error.CompilationError) if (fallback) |fb| return runEval(arena, page, fb, null);
+        ls.local.runMicrotasks();
         return .{ .text = try formatJsError(arena, &try_catch, err), .is_error = true };
     };
+    ls.local.runMicrotasks();
 
     if (js_result.isPromise()) {
         const promise = js_result.toPromise();

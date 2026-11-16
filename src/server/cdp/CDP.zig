@@ -457,6 +457,7 @@ pub const BrowserContext = struct {
 
     http_proxy_changed: bool = false,
     user_agent_changed: bool = false,
+    network_conditions_changed: bool = false,
 
     download_session_id: ?[]const u8 = null,
 
@@ -548,6 +549,9 @@ pub const BrowserContext = struct {
         }
         if (self.user_agent_changed) {
             browser.http_client.clearUserAgentOverride();
+        }
+        if (self.network_conditions_changed) {
+            browser.http_client.resetNetworkConditions();
         }
         browser.http_client.clearAcceptLanguageOverride();
         browser.clearPermissions();

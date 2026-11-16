@@ -582,6 +582,14 @@ pub const Connection = struct {
         }
     }
 
+    pub fn setMaxRecvSpeed(self: *const Connection, bytes_per_sec: u64) !void {
+        try libcurl.curl_easy_setopt(self._easy, .max_recv_speed_large, bytes_per_sec);
+    }
+
+    pub fn setMaxSendSpeed(self: *const Connection, bytes_per_sec: u64) !void {
+        try libcurl.curl_easy_setopt(self._easy, .max_send_speed_large, bytes_per_sec);
+    }
+
     pub fn getEffectiveUrl(self: *const Connection) ![*c]const u8 {
         var url: [*c]u8 = undefined;
         try libcurl.curl_easy_getinfo(self._easy, .effective_url, &url);

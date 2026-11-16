@@ -252,6 +252,7 @@ const table_head =
     \\|------|-------|
     \\| `new Page()` | Makes a page object. No navigation yet — call `page.goto(url)` before any other method. Make several to navigate in parallel (fan-out, best practice 2). |
     \\| `page.close()` | Marks the page done; later method calls on it error. The page is otherwise reclaimed at script end. |
+    \\| `page.setViewport(width, height[, { deviceScaleFactor }])` | Resizes the viewport in CSS pixels (also accepts `{ width, height, deviceScaleFactor }`). May be called before or after `page.goto(url)`. |
 ;
 
 const prose_tail =
